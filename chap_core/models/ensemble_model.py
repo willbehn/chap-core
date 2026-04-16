@@ -27,8 +27,9 @@ class EnsembleModel(ConfiguredModel):
         print(f"Locations i predictions: {predictions[0].keys()}")
 
         for loc in predictions[0].keys():
-            avg_samples = np.mean([pred[loc].samples for pred in predictions], axis=0)
+            avg_samples = np.concatenate([pred[loc].samples for pred in predictions], axis=-1)
 
             averaged[loc] = Samples(predictions[0][loc].time_period, avg_samples)
 
+        print(f"Final prediction:\n{averaged}")
         return DataSet(averaged)
