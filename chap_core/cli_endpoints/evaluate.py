@@ -515,7 +515,7 @@ def evaluate2(
     )
 
 
-def eval_ensemble(
+def eval_ensemble2(
     model_a_path: str,
     model_b_path: str,
     dataset_csv: str,
@@ -548,7 +548,7 @@ def eval_ensemble(
 
 
 
-def eval_ensemble2(
+def eval_ensemble(
     model_a: str,
     model_b: str,
     dataset_csv: str,
@@ -574,7 +574,7 @@ def eval_ensemble2(
         model_template_db = ModelTemplateDB(
             id="ensemble", 
             name="ensemble", 
-            version=template.model_template_config.version or "unknown",
+            version="unknown",
         )
 
         configured_model_db = ConfiguredModelDB(
