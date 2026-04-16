@@ -547,6 +547,63 @@ def eval_ensemble(
     print(f"Results: {results}")
 
 
+
+def eval_ensemble2(
+    model_a: str,
+    model_b: str,
+    dataset_csv: str,
+    output_file: Path,
+    backtest_params: BackTestParams = BackTestParams(n_periods=3, n_splits=7, stride=1),
+):
+    from chap_core.database.model_templates_and_config_tables import ConfiguredModelDB, ModelTemplateDB
+    from chap_core.models.ensemble_model import EnsembleModel
+
+    csv_path, url_geojson_path = resolve_csv_path(dataset_csv)
+    geojson_path = url_geojson_path or discover_geojson(csv_path)
+    dataset = load_dataset_from_csv(csv_path, geojson_path, None)
+
+    template_a = ModelTemplate.from_directory_or_github_url(model_a, base_working_dir=CHAP_RUNS_DIR)
+    template_b = ModelTemplate.from_directory_or_github_url(model_b, base_working_dir=CHAP_RUNS_DIR)
+
+    with template_a, template_b:
+        estimator_a = template_a.get_model(None)()
+        estimator_b = template_b.get_model(None)()
+
+        ensemble = EnsembleModel([estimator_a, estimator_b])
+
+        model_template_db = ModelTemplateDB(
+            id="ensemble", 
+            name="ensemble", 
+            version=template.model_template_config.version or "unknown",
+        )
+
+        configured_model_db = ConfiguredModelDB(
+            id="cli_eval_ensemble",
+            model_template_id=model_template_db.id,
+            model_template=model_template_db,
+            configuration={},
+        )
+
+        evaluation = Evaluation.create(
+            configured_model=configured_model_db,
+            estimator=ensemble,
+            dataset=dataset,
+            backtest_params=backtest_params,
+            backtest_name="ensemble_evaluation",
+        )
+
+        evaluation.to_file(filepath=output_file, model_name="ensemble")
+        print(f"Evaluation complete. Results saved to {output_file}")
+
+        from chap_core.assessment.backtest_plots import create_plot_from_evaluation
+
+        plot_path = output_file.with_suffix(".html")
+        logger.info(f"Generating evaluation plot to {plot_path}")
+        chart = create_plot_from_evaluation("evaluation_plot", evaluation)
+        chart.save(str(plot_path))
+        logger.info(f"Plot saved to {plot_path}")
+
+
 def register_commands(app):
     """Register evaluate commands with the CLI app."""
     app.command()(evaluate_hpo)
