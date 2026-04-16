@@ -1,0 +1,6 @@
+name: test
+
+strategy: average
+models:
+  - path: path/model1
+  - path: path/model2
