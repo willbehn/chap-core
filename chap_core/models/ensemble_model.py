@@ -15,13 +15,20 @@ class EnsembleModel(ConfiguredModel):
         return self
 
     def predict(self, historic_data: DataSet, future_data: DataSet) -> DataSet:
+        print("\n\nEnsemble prediction:")
+
         predictions = [model.predict(historic_data, future_data) for model in self._models]
+
+        for i,pred in enumerate(predictions):
+            print(f"Modell {i+1} prediction:\n {pred}");
+
         averaged = {}
 
-        print(f"\n\n\nKEYS i predictions: {predictions[0].keys()}\n\n\n")
+        print(f"Locations i predictions: {predictions[0].keys()}")
 
         for loc in predictions[0].keys():
             avg_samples = np.mean([pred[loc].samples for pred in predictions], axis=0)
+
             averaged[loc] = Samples(predictions[0][loc].time_period, avg_samples)
-            
+
         return DataSet(averaged)
