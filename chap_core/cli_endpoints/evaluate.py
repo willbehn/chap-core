@@ -515,9 +515,42 @@ def evaluate2(
     )
 
 
+def eval_ensemble(
+    model_a_path: str,
+    model_b_path: str,
+    dataset_csv: str,
+    prediction_length: int = 3,
+    n_splits: int = 1,
+):
+    from chap_core.models.ensemble_model import EnsembleModel
+
+
+    csv_path, url_geojson_path = resolve_csv_path(dataset_csv)
+    geojson_path = url_geojson_path or discover_geojson(csv_path)
+    dataset = load_dataset_from_csv(csv_path, geojson_path, None)
+
+    template_a = ModelTemplate.from_directory_or_github_url(model_a_path, base_working_dir=CHAP_RUNS_DIR)
+    template_b = ModelTemplate.from_directory_or_github_url(model_b_path, base_working_dir=CHAP_RUNS_DIR)
+
+    with template_a, template_b:
+        model_a = template_a.get_model(None)()
+        model_b = template_b.get_model(None)()
+        ensemble = EnsembleModel([model_a, model_b])
+
+        results = evaluate_model(
+            estimator=ensemble,
+            data=dataset,
+            prediction_length=prediction_length,
+            n_test_sets=n_splits,
+        )
+
+    print(f"Results: {results}")
+
+
 def register_commands(app):
     """Register evaluate commands with the CLI app."""
     app.command()(evaluate_hpo)
     app.command()(evaluate)
     app.command()(evaluate2)
     app.command(name="eval")(eval_cmd)
+    app.command()(eval_ensemble)
