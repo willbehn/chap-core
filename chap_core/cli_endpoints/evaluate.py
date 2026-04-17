@@ -514,43 +514,8 @@ def evaluate2(
         data_source_mapping=data_source_mapping,
     )
 
-
-def eval_ensemble2(
-    model_a_path: str,
-    model_b_path: str,
-    dataset_csv: str,
-    prediction_length: int = 3,
-    n_splits: int = 1,
-):
-    from chap_core.models.ensemble_model import EnsembleModel
-
-
-    csv_path, url_geojson_path = resolve_csv_path(dataset_csv)
-    geojson_path = url_geojson_path or discover_geojson(csv_path)
-    dataset = load_dataset_from_csv(csv_path, geojson_path, None)
-
-    template_a = ModelTemplate.from_directory_or_github_url(model_a_path, base_working_dir=CHAP_RUNS_DIR)
-    template_b = ModelTemplate.from_directory_or_github_url(model_b_path, base_working_dir=CHAP_RUNS_DIR)
-
-    with template_a, template_b:
-        model_a = template_a.get_model(None)()
-        model_b = template_b.get_model(None)()
-        ensemble = EnsembleModel([model_a, model_b])
-
-        results = evaluate_model(
-            estimator=ensemble,
-            data=dataset,
-            prediction_length=prediction_length,
-            n_test_sets=n_splits,
-        )
-
-    print(f"Results: {results}")
-
-
-
 def eval_ensemble(
-    model_a: str,
-    model_b: str,
+    model_configuration_yaml: Path,
     dataset_csv: str,
     output_file: Path,
     backtest_params: BackTestParams = BackTestParams(n_periods=3, n_splits=7, stride=1),
@@ -562,46 +527,47 @@ def eval_ensemble(
     geojson_path = url_geojson_path or discover_geojson(csv_path)
     dataset = load_dataset_from_csv(csv_path, geojson_path, None)
 
-    template_a = ModelTemplate.from_directory_or_github_url(model_a, base_working_dir=CHAP_RUNS_DIR)
-    template_b = ModelTemplate.from_directory_or_github_url(model_b, base_working_dir=CHAP_RUNS_DIR)
+    configuration = yaml.safe_load(open(model_configuration_yaml))
+    model_paths = [m["path"] for m in configuration["models"]]
+    templates = [ModelTemplate.from_directory_or_github_url(path, base_working_dir=CHAP_RUNS_DIR) for path in model_paths]
 
-    with template_a, template_b:
-        estimator_a = template_a.get_model(None)()
-        estimator_b = template_b.get_model(None)()
+    if not templates:
+        return
 
-        ensemble = EnsembleModel([estimator_a, estimator_b])
+    estimators = [template.get_model(None)() for template in templates]
+    ensemble = EnsembleModel(estimators)
 
-        model_template_db = ModelTemplateDB(
-            id="ensemble", 
-            name="ensemble", 
-            version="unknown",
-        )
+    model_template_db = ModelTemplateDB(
+        id="ensemble",
+        name="ensemble",
+        version="unknown",
+    )
 
-        configured_model_db = ConfiguredModelDB(
-            id="cli_eval_ensemble",
-            model_template_id=model_template_db.id,
-            model_template=model_template_db,
-            configuration={},
-        )
+    configured_model_db = ConfiguredModelDB(
+        id="cli_eval_ensemble",
+        model_template_id=model_template_db.id,
+        model_template=model_template_db,
+        configuration=configuration,
+    )
 
-        evaluation = Evaluation.create(
-            configured_model=configured_model_db,
-            estimator=ensemble,
-            dataset=dataset,
-            backtest_params=backtest_params,
-            backtest_name="ensemble_evaluation",
-        )
+    evaluation = Evaluation.create(
+        configured_model=configured_model_db, 
+        estimator=ensemble,
+        dataset=dataset,
+        backtest_params=backtest_params,
+        backtest_name="ensemble_evaluation",
+    )
 
-        evaluation.to_file(filepath=output_file, model_name="ensemble")
-        print(f"Evaluation complete. Results saved to {output_file}")
+    evaluation.to_file(filepath=output_file, model_name="ensemble")
+    print(f"Evaluation complete. Results saved to {output_file}")
 
-        from chap_core.assessment.backtest_plots import create_plot_from_evaluation
+    from chap_core.assessment.backtest_plots import create_plot_from_evaluation
 
-        plot_path = output_file.with_suffix(".html")
-        logger.info(f"Generating evaluation plot to {plot_path}")
-        chart = create_plot_from_evaluation("evaluation_plot", evaluation)
-        chart.save(str(plot_path))
-        logger.info(f"Plot saved to {plot_path}")
+    plot_path = output_file.with_suffix(".html")
+    logger.info(f"Generating evaluation plot to {plot_path}")
+    chart = create_plot_from_evaluation("evaluation_plot", evaluation)
+    chart.save(str(plot_path))
+    logger.info(f"Plot saved to {plot_path}")
 
 
 def register_commands(app):
