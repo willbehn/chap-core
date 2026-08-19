@@ -267,7 +267,10 @@ def perturb_vectors(
                 else:
                     # Use global mean across all locations as the turned off feature,
                     # or 0.0 when the full dataset contains only one location. TODO 0.0 could be meaningless OOD
-                    pb[parent_key] = global_means.get(parent_key, 0.0) if global_means else 0.0
+
+                    base_name = parent_key.split("_fut_")[0]
+                    pb[parent_key] = global_means.get(base_name, 0.0) if global_means else 0.0
+
                 pb_mask[parent_key] = is_present
                 continue
 
@@ -919,7 +922,7 @@ def save_explanation(
 
 
 @dataclass
-class _LimeInputs:
+class ExplainInputs:
     """Prepared inputs shared by explain() and explain_adaptive() before they
     diverge into standard vs. adaptive mask selection."""
 
@@ -937,7 +940,7 @@ class _LimeInputs:
     global_means: dict[str, float] | None
 
 
-def _prepare_lime_inputs(
+def prepare_explain_inputs(
     *,
     dataset: DataSet,
     location: str,
@@ -949,7 +952,7 @@ def _prepare_lime_inputs(
     last_n: int | None,
     timed: bool,
     start: float,
-) -> _LimeInputs:
+) -> ExplainInputs:
     """Build the climate forecast, slice to the target location, derive the
     interpretable original vector ``x0`` and its feature indices, and construct
     the sampler and per-feature global means.
@@ -1034,7 +1037,7 @@ def _prepare_lime_inputs(
         {feat: float(full_dataset_df[feat].mean()) for feat in features_hist} if num_locations > 1 else None
     )
 
-    return _LimeInputs(
+    return ExplainInputs(
         full_future_weather=full_future_weather,
         hist_type=hist_type,
         fut_type=fut_type,
@@ -1099,7 +1102,7 @@ def explain(
     # =================================================================
     # Prepare dataset + build the original vector
     # =================================================================
-    inputs = _prepare_lime_inputs(
+    inputs = prepare_explain_inputs(
         dataset=dataset,
         location=location,
         horizon=horizon,
@@ -1383,7 +1386,7 @@ def explain_adaptive(
     # =================================================================
     # Prepare dataset + build the original vector
     # =================================================================
-    inputs = _prepare_lime_inputs(
+    inputs = prepare_explain_inputs(
         dataset=dataset,
         location=location,
         horizon=horizon,
