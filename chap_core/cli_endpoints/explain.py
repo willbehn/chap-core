@@ -174,6 +174,101 @@ def explain_lime(
                     logger.info(f"  {key:>15} = {value:+.4f}")
 
 
+def explain_shap(
+    model_name: ModelNameArg,
+    dataset_csv: DatasetCsvArg,
+    location: Annotated[
+        list[str] | None,
+        Parameter(
+            help="Location name(s) to explain (repeatable, e.g. --location A --location B). Required unless --all-locations is set."
+        ),
+    ] = None,
+    all_locations: Annotated[
+        bool,
+        Parameter(
+            help="Explain every org-unit in the dataset. Warning: this runs a full perturbation loop "
+            "(~num-perturbations model calls) per location, so it can be very slow on many-location datasets."
+        ),
+    ] = False,
+    horizon: Annotated[
+        int,
+        Parameter(help="Number of time steps into the future to explain"),
+    ] = 1,
+    lime_params: Annotated[
+        LimeParams,
+        Parameter(
+            help="LIME pipeline configuration. Use --lime-params.granularity for segment count, "
+            "--lime-params.segmenter-name for segmentation strategy, "
+            "--lime-params.sampler-name for perturbation strategy, "
+            "--lime-params.num-perturbations for sample count, "
+            "--lime-params.adaptive to enable adaptive mode"
+        ),
+    ] = LimeParams(),
+    run_config: RunConfigArg = RunConfig(),
+    model_configuration_yaml: ModelConfigYamlArg = None,
+    save: Annotated[
+        bool,
+        Parameter(help="Save explanation as a markdown file under runs/explainability/"),
+    ] = True,
+):
+    """
+    Explain a model prediction by providing variable contribution weighting.
+    """
+    import yaml
+
+    from chap_core.database.model_templates_and_config_tables import ModelConfiguration
+    from chap_core.explainability.kernel_shap import explain_shap as explain_fn
+    from chap_core.log_config import initialize_logging
+    from chap_core.models.model_template import ModelTemplate
+
+    initialize_logging(run_config.debug, run_config.log_file)
+
+    csv_path, url_geojson_path = resolve_csv_path(dataset_csv)
+    geojson_path = url_geojson_path or discover_geojson(csv_path)
+    dataset = load_dataset_from_csv(csv_path, geojson_path)
+
+    # Fail fast on a bad/missing location before the (expensive) model load.
+    locations = _resolve_locations(location, all_locations, list(dataset.locations()))
+
+    configuration = None
+    if model_configuration_yaml is not None:
+        logger.info(f"Loading model configuration from {model_configuration_yaml}")
+        with open(model_configuration_yaml) as f:
+            configuration = ModelConfiguration.model_validate(yaml.safe_load(f))
+
+    logger.info(f"Loading model template from {model_name}")
+    template = ModelTemplate.from_directory_or_github_url(
+        model_name,
+        ignore_env=run_config.ignore_environment,
+        run_dir_type="use_existing",
+        is_chapkit_model=run_config.is_chapkit_model,
+    )
+
+    with template:
+        model = template.get_model(configuration)  # type: ignore[arg-type]
+        estimator = model()
+
+        for loc in locations:
+            logger.info(f"Generating explanation for {loc}, {horizon} time steps into the future.")
+
+            explain_fn(
+                model=estimator,
+                dataset=dataset,
+                location=loc,
+                horizon=horizon,
+                num_perturbations=lime_params.num_perturbations,
+                segmenter_name=lime_params.segmenter_name,
+                sampler_name=lime_params.sampler_name,
+                seed=lime_params.seed,
+                timed=lime_params.timed,
+                granularity=lime_params.granularity,
+                last_n=lime_params.last_n,
+                save=save,
+                plot=save,
+            )
+
+
 def register_commands(app):
     """Register evaluate commands with the CLI app."""
     app.command()(explain_lime)
+    app.command()(explain_shap)
