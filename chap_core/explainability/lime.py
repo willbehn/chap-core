@@ -938,7 +938,7 @@ class _LimeInputs:
     global_means: dict[str, float] | None
 
 
-def _prepare_lime_inputs(
+def prepare_explain_inputs(
     *,
     dataset: DataSet,
     location: str,
@@ -1125,7 +1125,7 @@ def explain(
     # =================================================================
     # Prepare dataset + build the original vector
     # =================================================================
-    inputs = _prepare_lime_inputs(
+    inputs = prepare_explain_inputs(
         dataset=dataset,
         location=location,
         horizon=horizon,
@@ -1412,7 +1412,7 @@ def explain_adaptive(
     # =================================================================
     # Prepare dataset + build the original vector
     # =================================================================
-    inputs = _prepare_lime_inputs(
+    inputs = prepare_explain_inputs(
         dataset=dataset,
         location=location,
         horizon=horizon,
