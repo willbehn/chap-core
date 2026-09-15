@@ -1,19 +1,19 @@
 import logging
 import time
+
 import numpy as np
 import shap
 
 logger = logging.getLogger(__name__)
 
+from chap_core.explainability.lime import (
+    build_feature_map,
+    perturb_vectors,
+    predict_pertubations,
+    prepare_explain_inputs,
+)
 from chap_core.models.external_model import ExternalModel
 from chap_core.spatio_temporal_data.temporal_dataclass import DataSet
-
-from chap_core.explainability.lime import (
-    prepare_explain_inputs,
-    build_feature_map, 
-    perturb_vectors,
-    predict_pertubations
-)
 
 """
 TODO fjern etterhvert
@@ -36,37 +36,34 @@ def _check_allowed_sampler(sampler_name: str):
     return sampler_name
 
 
-def explain_shap(
-        model: ExternalModel,
-        dataset: DataSet,
-        location: str,
-        horizon: int = 3,
-        granularity: int = 10,
-        num_perturbations: int = 300,
-        segmenter_name: str = "uniform",
-        sampler_name: str = "global_mean",
-        last_n: int | None = None,
-        seed: int | None = None,
-        timed: bool = False,
-    ) -> list[tuple[str, float]]:
-    
-    start = time.perf_counter()
-    if timed:
-        logger.info("Started SHAP pipeline")
+def _explain_shap(
+    *,
+    model: ExternalModel,
+    dataset: DataSet,
+    location: str,
+    horizon: int,
+    granularity: int,
+    num_perturbations: int,
+    segmenter_name: str,
+    sampler_name: str,
+    last_n: int | None,
+    seed: int | None,
+    timed: bool,
+    start: float,
+) -> list[tuple[str, float]]:
 
-    
     inputs = prepare_explain_inputs(
-            dataset=dataset,
-            location=location,
-            horizon=horizon,
-            segmenter_name=segmenter_name,
-            granularity=granularity,
-            sampler_name=_check_allowed_sampler(sampler_name),
-            seed=seed,
-            last_n=last_n,
-            timed=timed,
-            start=start,
-        )
+        dataset=dataset,
+        location=location,
+        horizon=horizon,
+        segmenter_name=segmenter_name,
+        granularity=granularity,
+        sampler_name=_check_allowed_sampler(sampler_name),
+        seed=seed,
+        last_n=last_n,
+        timed=timed,
+        start=start,
+    )
 
     print(f"inputs AFTER prepare_explain_inputs:\n{inputs}\n")
 
@@ -81,14 +78,14 @@ def explain_shap(
         print(masks)
 
         perturbations, perturbation_masks = perturb_vectors(
-                inputs.hist_df, 
-                inputs.x0, 
-                inputs.feat_indices, 
-                inputs.sampler, 
-                feature_map, 
-                masks, 
-                inputs.global_means
-            )
+            inputs.hist_df,
+            inputs.x0,
+            inputs.feat_indices,
+            inputs.sampler,
+            feature_map,
+            masks,
+            inputs.global_means
+        )
 
         # TODO currently explains the mean, and last timestep, todo for later
         _, y, _, _ = predict_pertubations(
@@ -125,4 +122,74 @@ def explain_shap(
         key=lambda item: item[0]
     )
     return results
-  
+
+
+def explain(
+    model: ExternalModel,
+    dataset: DataSet,
+    location: str,
+    horizon: int = 3,
+    granularity: int = 10,
+    num_perturbations: int = 300,
+    segmenter_name: str = "uniform",
+    sampler_name: str = "global_mean",
+    last_n: int | None = None,
+    seed: int | None = None,
+    timed: bool = False,
+) -> list[tuple[str, float]]:
+
+    start = time.perf_counter()
+    if timed:
+        logger.info("Started SHAP pipeline")
+
+    """
+    psudokode:
+    if (scope_explanation):
+        dataset, last_n = prune_temporal_depth(model, dataset, location)
+    """
+
+    result = _explain_shap(
+        model=model,
+        dataset=dataset,
+        location=location,
+        horizon=horizon,
+        granularity=granularity,
+        num_perturbations=num_perturbations,
+        segmenter_name=segmenter_name,
+        sampler_name=sampler_name,
+        last_n=last_n,
+        seed=seed,
+        timed=timed,
+        start=start,
+    )
+
+    end = time.perf_counter()
+    if timed:
+        logger.info(f"SHAP pipeline done, used {end-start}")
+
+    return result
+
+# Pruning strategy based on TimeSHAP, prunes the depth of the dataset
+def prune_temporal_depth(model: ExternalModel, dataset: DataSet, location: str):
+    """
+    psudokode:
+    for i in {max_depth-1, max_depth-2 osv til}:
+        koalisjoner = lag_koalisjoner(i), idk her ennå
+
+        splitte datasett inn i to grupper, en med gammel, og en med ny, basert på i
+        Regne ut shap verdier for hver gruppe med kernel shap
+
+        Hvis shap verdi for gammelgruppe < threshold
+            return i, der i er tidssteget man pruner på 
+
+    retun 0, ingen pruning lenger
+    """
+
+    max_depth = len(dataset.period_range)
+
+    # Ranges fdrom max_depth -1 to 1
+    for i in range(max_depth - 1, 0, -1):
+        period_range = dataset.period_range
+
+        new = dataset.restrict_time_period(slice(period_range[-1], None))
+        old = dataset.restrict_time_period(slice(None, period_range[-i, 1]))
