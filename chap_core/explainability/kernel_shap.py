@@ -27,7 +27,7 @@ Sende dette inn i KernelExplainer med 0 som background, og 1 som på
 # Some of the samplers for lime might not work as intended for shap, will update
 # with more samplers
 def _check_allowed_sampler(sampler_name: str):
-    allowed_samplers = {"global_mean"} # TODO expand with "background", "random" later
+    allowed_samplers = {"global_mean", "background"} # TODO expand with other samplers later
 
     assert sampler_name in allowed_samplers, (
         "Sampler not supported"
@@ -40,7 +40,7 @@ def explain_shap(
         model: ExternalModel,
         dataset: DataSet,
         location: str,
-        horizon: int,
+        horizon: int = 3,
         granularity: int = 10,
         num_perturbations: int = 300,
         segmenter_name: str = "uniform",
@@ -48,7 +48,7 @@ def explain_shap(
         last_n: int | None = None,
         seed: int | None = None,
         timed: bool = False,
-    ):
+    ) -> list[tuple[str, float]]:
     
     start = time.perf_counter()
     if timed:
@@ -72,9 +72,10 @@ def explain_shap(
 
     feature_map = build_feature_map(inputs.x0)
     num_features = len(feature_map)
+    feature_names = [name for name, _, _ in feature_map]
 
+    print(f"\n\nNUMBER OF FEATURES: {num_features}\n\n")
     print(f"feature_map AFTER build_feature_map:\n{feature_map}\n")
-
 
     def value_fn(masks: np.ndarray) -> np.ndarray:
         print(masks)
@@ -86,9 +87,10 @@ def explain_shap(
                 inputs.sampler, 
                 feature_map, 
                 masks, 
-                lobal_means
+                inputs.global_means
             )
 
+        # TODO currently explains the mean, and last timestep, todo for later
         _, y, _, _ = predict_pertubations(
             model,
             inputs.hist_df,
@@ -110,9 +112,17 @@ def explain_shap(
         return np.array(y)
 
 
-
-    background = np.zeroes((1,num_features))
+    np.random.seed(seed=seed)
+    background = np.zeros((1,num_features))
     instance = np.ones((1, num_features))
 
     explainer = shap.KernelExplainer(value_fn, background)
+
+    shap_values = explainer.shap_values(instance, nsamples=num_perturbations, l1_reg=False)
+
+    results = sorted(
+        zip(feature_names, np.asarray(shap_values).ravel().tolist(), strict=True),
+        key=lambda item: item[0]
+    )
+    return results
   
