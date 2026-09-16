@@ -69,13 +69,13 @@ def eLoss(
         hist_df / fut_df: Historical and future feature dataframes for the
             location being explained.
         feature_names / features_hist / features_fut: Name lists used by
-            ``perturb_vectors`` / ``produce_lime_dataset``.
+            ``perturb_vectors`` / ``predict_pertubations``.
         horizon / location / hist_type / fut_type / feat_indices: Forwarded
             unchanged to the perturbation + prediction machinery.
         y_orig: Baseline model prediction for the unperturbed input.
         full_dataset / full_future_weather: Optional surrounding context the
             model may need when ``model.predict`` is one-hot-location-sensitive
-            (matching ``produce_lime_dataset``'s fallback path).
+            (matching ``predict_pertubations``'s fallback path).
         global_means: Per-feature dataset means used to fill turned-off static
             features, exactly as ``explain`` does. Must match what the
             explanation used (``None`` on single-location data, the dataset
@@ -91,7 +91,7 @@ def eLoss(
     """
     # Lazy import to avoid a circular dependency: lime.py imports this module
     # inside its `if return_metrics:` block at call time.
-    from chap_core.explainability.lime import perturb_vectors, produce_lime_dataset
+    from chap_core.explainability.lime import perturb_vectors, predict_pertubations
 
     num_features = len(feature_names)
     if num_features == 0:
@@ -121,7 +121,7 @@ def eLoss(
         pb, pb_mask = perturb_vectors(
             hist_df, original_vector, feat_indices, sampler, feature_map, masks, global_means=global_means
         )
-        _, y, _, _ = produce_lime_dataset(
+        _, y, _, _ = predict_pertubations(
             model,
             hist_df,
             fut_df,

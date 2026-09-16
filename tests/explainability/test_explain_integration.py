@@ -143,7 +143,7 @@ class TestExplainEndToEnd:
         results = _explain_with_defaults(MockExternalModel(), small_full_dataset)
         names = {name for name, _ in results}
         # Historic features should be segmented into lags.
-        assert any("_lag_" in name for name in names)
+        assert any("_seg_" in name for name in names)
         # Future features should appear with _fut_N suffixes (horizon=2 -> _fut_1, _fut_2).
         assert any("_fut_" in name for name in names)
 
@@ -265,7 +265,7 @@ class TestLastN:
 
 
 class TestSinglePredictionPath:
-    """produce_lime_dataset predicts one perturbation at a time against the real
+    """predict_pertubations predicts one perturbation at a time against the real
     location set — it does not batch perturbations under synthetic `pb_` ids."""
 
     def test_no_pseudo_locations_one_predict_per_perturbation(self, small_full_dataset):
@@ -324,7 +324,7 @@ class TestSaveAndPlot:
         monkeypatch.setattr(lime_module, "CHAP_RUNS_DIR", tmp_path)
 
         args = dict(
-            results=[("rainfall_lag_0", 0.5)],
+            results=[("rainfall_seg_0", 0.5)],
             model_name="mock_model",
             location="alpha",
             horizon=1,

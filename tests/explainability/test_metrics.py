@@ -86,7 +86,7 @@ class TestFaithfulnessSign:
             return None, np.asarray(ys), None, None
 
         monkeypatch.setattr(lime_module, "perturb_vectors", fake_perturb)
-        monkeypatch.setattr(lime_module, "produce_lime_dataset", fake_produce)
+        monkeypatch.setattr(lime_module, "predict_pertubations", fake_produce)
 
         delta, auc_top, auc_bottom = eLoss(
             **_common_args(),
@@ -119,7 +119,7 @@ class TestFaithfulnessSign:
             return None, np.asarray(ys), None, None
 
         monkeypatch.setattr(lime_module, "perturb_vectors", fake_perturb)
-        monkeypatch.setattr(lime_module, "produce_lime_dataset", fake_produce)
+        monkeypatch.setattr(lime_module, "predict_pertubations", fake_produce)
 
         delta, _, _ = eLoss(
             **_common_args(),
@@ -145,7 +145,7 @@ class TestReturnShape:
             return None, np.full(len(perturbations), 0.5), None, None
 
         monkeypatch.setattr(lime_module, "perturb_vectors", fake_perturb)
-        monkeypatch.setattr(lime_module, "produce_lime_dataset", fake_produce)
+        monkeypatch.setattr(lime_module, "predict_pertubations", fake_produce)
 
         result = eLoss(
             **_common_args(),
@@ -175,7 +175,7 @@ class TestGlobalMeansForwarding:
             return None, np.zeros(len(perturbations)), None, None
 
         monkeypatch.setattr(lime_module, "perturb_vectors", fake_perturb)
-        monkeypatch.setattr(lime_module, "produce_lime_dataset", fake_produce)
+        monkeypatch.setattr(lime_module, "predict_pertubations", fake_produce)
 
         gm = {"a": 1.5, "b": 2.5, "c": 3.5}
         eLoss(
@@ -203,7 +203,7 @@ def test_n_buckets_parameter_does_not_crash(n_buckets, monkeypatch):
         return None, np.zeros(len(perturbations)), None, None
 
     monkeypatch.setattr(lime_module, "perturb_vectors", fake_perturb)
-    monkeypatch.setattr(lime_module, "produce_lime_dataset", fake_produce)
+    monkeypatch.setattr(lime_module, "predict_pertubations", fake_produce)
 
     delta, _, _ = eLoss(
         **_common_args(),

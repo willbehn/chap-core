@@ -20,8 +20,8 @@ def parse_coefficients(
     static_columns: dict[str, float] = {}
 
     for name, value in coefficients:
-        if "_lag_" in name:
-            base, lag = name.rsplit("_lag_", 1)
+        if "_seg_" in name:
+            base, lag = name.rsplit("_seg_", 1)
             if base not in temp_columns:
                 temp_columns[base] = {}
             temp_columns[base][int(lag)] = value

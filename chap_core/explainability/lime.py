@@ -14,7 +14,7 @@ The pipeline, for a single prediction at one location:
    perturbation, over the interpretable features.
 3. **Perturb** (:func:`perturb_vectors`) — materialise each mask into a real
    ``(hist, fut)`` pair, filling "off" segments via the sampler.
-4. **Predict** (:func:`produce_lime_dataset`) — run the black-box model on
+4. **Predict** (:func:`predict_pertubations`) — run the black-box model on
    every perturbation (one prediction per perturbation, against the real
    location set) to get the responses.
 5. **Weight** (:func:`compute_local_weights`) — score each perturbation by
@@ -267,7 +267,8 @@ def perturb_vectors(
                 else:
                     # Use global mean across all locations as the turned off feature,
                     # or 0.0 when the full dataset contains only one location. TODO 0.0 could be meaningless OOD
-                    pb[parent_key] = global_means.get(parent_key, 0.0) if global_means else 0.0
+                    base_name = parent_key.split("_fut_")[0]
+                    pb[parent_key] = global_means.get(base_name, 0.0) if global_means else 0.0
                 pb_mask[parent_key] = is_present
                 continue
 
@@ -416,7 +417,7 @@ def flatten_vector(vector: dict) -> dict[str, int]:
     for key, val in vector.items():
         if isinstance(val, dict):
             for lag, segment_data in val.items():
-                flat[f"{key}_lag_{lag}"] = segment_data
+                flat[f"{key}_seg_{lag}"] = segment_data
         elif isinstance(val, (int, float)):
             flat[key] = val
     return flat
@@ -438,11 +439,11 @@ def build_feature_map(
     # Loop over original vector and extract key (feature name) and lag index
     for key, val in orig_vector.items():
         if isinstance(val, dict):
-            feature_map.extend((f"{key}_lag_{lag}", key, lag) for lag in val)
+            feature_map.extend((f"{key}_seg_{lag}", key, lag) for lag in val)
         elif isinstance(val, (int, float)):
             feature_map.append((key, key, None))
 
-    # feature_map is a list of lagged feature names (e.g. temperature_lag_3)
+    # feature_map is a list of lagged feature names (e.g. temperature_seg_3)
     # and corresponding feature name and lag (e.g. temperature and 3)
     return feature_map
 
@@ -652,7 +653,7 @@ def build_dtw_sequence(
     return seq
 
 
-def produce_lime_dataset(
+def predict_pertubations(
     model: ExternalModel,
     hist_df: pd.DataFrame,
     future_df: pd.DataFrame,
@@ -702,7 +703,7 @@ def produce_lime_dataset(
         models need their real location set; see the inline comment below.
     """
     if full_dataset is None or full_future_weather is None:
-        raise ValueError("produce_lime_dataset requires full_dataset and full_future_weather")
+        raise ValueError("predict_pertubations requires full_dataset and full_future_weather")
 
     results: list[tuple[dict[str, Any], float]] = []
     distance_sequences: list[np.ndarray] = []
@@ -731,7 +732,7 @@ def produce_lime_dataset(
         if pred_v is None:
             raise ModelFailedException(f"model.predict returned None for perturbation {j}")
         vals = avg_samples(pred_v.filter_locations([location]))
-        latest = max(vals.keys())
+        latest = max(vals.keys()) # TODO predicts only last timestep for now
         distance_sequences.append(seq)
         results.append((flatten_vector(pb_mask), vals[latest]))
 
@@ -754,7 +755,7 @@ def disambiguate_surrogate(name: str) -> SurrogateModel:
             raise ValueError(f"Unknown surrogate model: {name}")
 
 
-def disambiguate_segmenter(name: str, granularity: int, window_size: int | None = None) -> SegmentationModel:
+def disambiguate_segmenter(name: str, granularity: int, window_size: int | None = None, split_index = 2) -> SegmentationModel:
     """
     Fetch the actual segmenter instance from the short name
 
@@ -919,7 +920,7 @@ def save_explanation(
 
 
 @dataclass
-class _LimeInputs:
+class ExplainInputs:
     """Prepared inputs shared by explain() and explain_adaptive() before they
     diverge into standard vs. adaptive mask selection."""
 
@@ -950,7 +951,7 @@ def prepare_explain_inputs(
     last_n: int | None,
     timed: bool,
     start: float,
-) -> _LimeInputs:
+) -> ExplainInputs:
     """Build the climate forecast, slice to the target location, derive the
     interpretable original vector ``x0`` and its feature indices, and construct
     the sampler and per-feature global means.
@@ -1057,7 +1058,7 @@ def prepare_explain_inputs(
         {feat: float(full_dataset_df[feat].mean()) for feat in features_hist} if num_locations > 1 else None
     )
 
-    return _LimeInputs(
+    return ExplainInputs(
         dataset=restricted_dataset,
         full_future_weather=full_future_weather,
         hist_type=hist_type,
@@ -1155,7 +1156,7 @@ def explain(
     # Create perturbed variations
     # =================================================================
 
-    # Get structured list of new feature names (e.g. rainfall_lag_5) and their column names/lag indices
+    # Get structured list of new feature names (e.g. rainfall_seg_5) and their column names/lag indices
     feature_map = build_feature_map(x0)
     feature_names = [name for name, _, _ in feature_map]
     if len(feature_names) == 0:
@@ -1190,7 +1191,7 @@ def explain(
     # The surrogate model must be trained on the masks and the output of the original model
     # on the perturbed data, obtained here. Also obtain dtw sequences (simply the temporal columns in
     # a dataframe) for perturbations and original input, for later potential dtw distancing
-    X, y, distance_sequences, x0_sequence = produce_lime_dataset(
+    X, y, distance_sequences, x0_sequence = predict_pertubations(
         model,
         hist_df,
         future_df,
@@ -1273,7 +1274,7 @@ def explain(
         pb_orig, pb_mask_orig = perturb_vectors(
             hist_df, x0, feat_indices, sampler, feature_map, [mask_type1], global_means=global_means
         )
-        _, y_orig_arr, _, _ = produce_lime_dataset(
+        _, y_orig_arr, _, _ = predict_pertubations(
             model,
             hist_df,
             future_df,
@@ -1468,7 +1469,7 @@ def explain_adaptive(
     # Get target values for initial generated perturbations
     # =================================================================
 
-    X, y, distance_sequences, _ = produce_lime_dataset(
+    X, y, distance_sequences, _ = predict_pertubations(
         model,
         hist_df,
         future_df,
@@ -1608,7 +1609,7 @@ def explain_adaptive(
         # Produce new dataset combining old and new perturbations
         # =================================================================
 
-        X_new, y_new, distance_sequences_new, _ = produce_lime_dataset(
+        X_new, y_new, distance_sequences_new, _ = predict_pertubations(
             model,
             hist_df,
             future_df,
@@ -1698,7 +1699,7 @@ def explain_adaptive(
         pb_orig, pb_mask_orig = perturb_vectors(
             hist_df, x0, feat_indices, sampler, feature_map, [mask_type1], global_means=global_means
         )
-        _, y_orig_arr, _, _ = produce_lime_dataset(
+        _, y_orig_arr, _, _ = predict_pertubations(
             model,
             hist_df,
             future_df,

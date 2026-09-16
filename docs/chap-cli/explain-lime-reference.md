@@ -167,7 +167,7 @@ chap explain-lime \
     --lime-params.with-metrics
 ```
 
-This runs LIME against the trained model on the dataset it was trained on, producing a coefficient listing (e.g. `rainfall_lag_0`, `mean_temperature_lag_0`). With `--lime-params.with-metrics`, the `eLoss` faithfulness metric is computed and logged at the end.
+This runs LIME against the trained model on the dataset it was trained on, producing a coefficient listing (e.g. `rainfall_seg_0`, `mean_temperature_seg_0`). With `--lime-params.with-metrics`, the `eLoss` faithfulness metric is computed and logged at the end.
 
 !!! note "Coefficients vary run-to-run on stochastic models"
     The AR model's `predict` is stochastic, and `--lime-params.seed` only pins LIME's perturbation sampler — not the model. So the surrogate R², the coefficients, and `delta_eloss` can differ between two otherwise-identical invocations, especially at low perturbation counts. Interpret a real-model explanation alongside the faithfulness metrics rather than from the coefficients alone, and raise `--lime-params.num-perturbations` for a steadier fit.

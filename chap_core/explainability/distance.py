@@ -16,7 +16,7 @@ Two strategies are provided, differing in what they measure distance over:
 
 The ``takes_mask`` flag on each weighter tells the pipeline which of those
 two representations to hand to :meth:`get_weights` (see
-``produce_lime_dataset`` in ``lime.py``).
+``predict_pertubations`` in ``lime.py``).
 """
 
 from typing import Protocol
