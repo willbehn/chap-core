@@ -755,7 +755,7 @@ def disambiguate_surrogate(name: str) -> SurrogateModel:
             raise ValueError(f"Unknown surrogate model: {name}")
 
 
-def disambiguate_segmenter(name: str, granularity: int, window_size: int | None = None, split_index = 2) -> SegmentationModel:
+def disambiguate_segmenter(name: str, granularity: int, window_size: int | None = None) -> SegmentationModel:
     """
     Fetch the actual segmenter instance from the short name
 
@@ -944,7 +944,7 @@ def prepare_explain_inputs(
     dataset: DataSet,
     location: str,
     horizon: int,
-    segmenter_name: str,
+    segmenter: str | SegmentationModel,
     granularity: int,
     sampler_name: str,
     seed: int | None,
@@ -1039,7 +1039,9 @@ def prepare_explain_inputs(
 
     # Window size feeds matrix-profile segmenters (sliding-window length)
     window_size = min(max(5, len(hist_df) // 30), len(hist_df))
-    segmenter = disambiguate_segmenter(segmenter_name, granularity, window_size)
+
+    if isinstance(segmenter, str):
+        segmenter = disambiguate_segmenter(segmenter, granularity, window_size)
 
     if timed:
         print_time(start, "Finished LIME preparations in %.4f seconds")
