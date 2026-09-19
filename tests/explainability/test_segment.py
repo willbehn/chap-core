@@ -10,6 +10,7 @@ from chap_core.explainability.segment import (
     MatrixProfileSortedSlopeSegmentation,
     NNSegmentation,
     ReverseExponentialSegmentation,
+    SplitSegmentation,
     UniformSegmentation,
 )
 
@@ -115,3 +116,21 @@ class TestMatrixAndNNBoundaries:
         assert ranges[0][0] == 0 and ranges[-1][1] == 24, "must cover the whole series"
         for (_, end_prev), (start_next, _) in zip(ranges, ranges[1:], strict=False):
             assert end_prev == start_next, "segments must be contiguous"
+
+
+class TestSplitSegmentation:
+    def test_indices_cover_entire_series(self):
+        _, indices = SplitSegmentation(4).segment(_series(8))
+        ranges = sorted(indices.values())
+        assert ranges[0][0] == 0
+        assert ranges[-1][1] == 8
+
+    def test_returns_exactly_two_segments(self):
+        split_index = 3
+
+        _, indices = SplitSegmentation(split_index).segment(_series(8))
+        assert len(indices) == 2
+
+    def test_split_index_is_the_correct_index(self):
+        _, indices = SplitSegmentation(4).segment(_series(8))
+        assert indices == {1: (0, 4), 0: (4, 8)}

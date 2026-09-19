@@ -535,3 +535,28 @@ class NNSegmentation:
 #   NaNs, which gives a false sense of security.
 # Idea: evaluate boundary placement by iterating the rho() mean/variance
 #   dissimilarity over windows to the left and right of each candidate.
+
+
+class SplitSegmentation(SegmentationModel):
+    """
+    Two segments split at split_index.
+    Segment at key 1 is the old part up to split_index, segment at key 0 the recent part.
+    """
+
+    def __init__(self, split_index: int):
+        self.split_index = split_index
+
+    def segment(self, data: pd.DataFrame | pd.Series) -> tuple[Segments, Indices]:
+        if len(data) < 2:
+            raise ValueError(f"SplitSegmentation needs at least 2 rows to split, got {len(data)}")
+
+        split_index = max(1, min(len(data) - 1, self.split_index))
+
+        segments = {
+            0: cast("Segment", data.iloc[split_index:].to_numpy().tolist()),
+            1: cast("Segment", data.iloc[:split_index].to_numpy().tolist()),
+        }
+
+        indices = {0: (split_index, len(data)), 1: (0, split_index)}
+
+        return (segments, indices)
