@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from chap_core.explainability import lime as lime_module
-from chap_core.explainability.testing.metrics import eLoss
+from chap_core.explainability.metrics import eLoss
 
 
 def _common_args() -> dict:

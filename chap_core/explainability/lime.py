@@ -1270,7 +1270,7 @@ def explain(
     metrics: dict[str, float] = {"r2": float(r2), "n_eff": float(n_eff)}
 
     if return_metrics:
-        from chap_core.explainability.testing.metrics import eLoss
+        from chap_core.explainability.metrics import eLoss
 
         mask_type1 = np.ones(X.shape[1])
         pb_orig, pb_mask_orig = perturb_vectors(
@@ -1695,7 +1695,7 @@ def explain_adaptive(
     metrics: dict[str, float] = {"r2": float(r2), "n_eff": float(n_eff)}
 
     if return_metrics:
-        from chap_core.explainability.testing.metrics import eLoss
+        from chap_core.explainability.metrics import eLoss
 
         mask_type1 = np.ones(X.shape[1])
         pb_orig, pb_mask_orig = perturb_vectors(
