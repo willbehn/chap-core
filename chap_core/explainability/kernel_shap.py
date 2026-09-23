@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Some of the samplers for lime might not work as intended for shap, will update
 # with more samplers
 def _check_allowed_sampler(sampler_name: str):
-    allowed_samplers = {"global_mean", "background"}  # TODO expand with other samplers later
+    allowed_samplers = {"global_mean", "background", "fourier"}  # TODO expand with other samplers later
 
     if sampler_name not in allowed_samplers:
         raise ValueError("Sampler not supported")
@@ -54,14 +54,14 @@ def _explain_shap(
         raise ValueError("groups and player_names must be passed togheter")
 
     if groups is None:
-        groups, player_names = list(range(len(feature_map))), feature_names
+        features_to_groups, player_names = list(range(len(feature_map))), feature_names
 
-    groups = np.asarray(groups)
+    features_to_groups = np.asarray(groups)
 
-    print(f"GROUPS: {groups}")
+    #print(f"Feature to groups: {features_to_groups}")
 
     def value_fn(player_masks: np.ndarray) -> np.ndarray:
-        masks = player_masks[:, groups]
+        masks = player_masks[:, features_to_groups]
         #print(masks)
 
         perturbations, perturbation_masks = perturb_vectors(
@@ -95,7 +95,7 @@ def _explain_shap(
 
         return np.array(y)
 
-    num_players = groups.max() + 1
+    num_players = features_to_groups.max() + 1
 
     np.random.seed(seed=seed)
     background = np.zeros((1, num_players))
@@ -129,7 +129,6 @@ def explain(
         logger.info("Started SHAP pipeline")
 
     if scope_explanation:
-
         if prune_threshold is None:
             raise ValueError("prune_threshold must be set when scope_explanation is True")
         
@@ -184,9 +183,20 @@ def explain(
 
     return result
 
+# Helper function that removes static features from feature_map. This will result in the static features allways have 
+# their actual value when running predict for when both groups are on.
+# TODO not sure if I should drop it yet or not
+def drop_static_features(
+    feature_map: list[tuple[str, str, int | None]]
+) -> list[tuple[str, str, int | None]]:
+
+    # Keeps only features that has lags or that is a future feature
+    return [entry for entry in feature_map if entry[2] is not None or "_fut_" in entry[0]]
+
+
 # Helper function to group features into the old/new player game when doing timeshap-ish pruning
 def group_two_player_split(feature_map: list[tuple[str, str, int | None]]) -> list[int]:
-    print(feature_map)
+    #print(feature_map)
 
     # 0 is new, 1 is old, _fut_ will be added in new segments
     # TODO think also _seg_10... etc can be added, fix later
@@ -194,15 +204,13 @@ def group_two_player_split(feature_map: list[tuple[str, str, int | None]]) -> li
     return groups
 
 
-# Pruning strategy based on TimeSHAP, prunes the depth of the dataset
-# TODO what to do with static features?
+# Pruning strategy based on TimeSHAPs temporal coalition pruning algorithm
 def find_temporal_prune_depth(
     *,
     model: ExternalModel,
     dataset: DataSet,
     location: str,
     horizon: int,
-    granularity: int = 1,
     num_perturbations: int,
     sampler_name: str,
     last_n: int | None,
@@ -210,12 +218,17 @@ def find_temporal_prune_depth(
     timed: bool,
     start: float,
     threshold: float,
-) -> int:
+) -> tuple[int, list[float]]: #TODO change return value later after testing
+    
     max_depth = len(dataset.period_range)
-    print(f"STARTING TEMPORAL PRUNING, max depth={max_depth}")
+    print(f"Starting temporal pruning, max depth={max_depth}")
+
+    all_shap_values = []
 
     # Ranges fdrom max_depth -1 to 1
     for split_index in range(max_depth - 1, 0, -1):
+        print(f"    At split index {split_index}")
+
         """
         TODO regarding segmentation REMEBER TO REMOVE
         I need to pass down arguemtns to the segmenter from this call since I need to call it multiple times
@@ -229,7 +242,7 @@ def find_temporal_prune_depth(
             location=location,
             horizon=horizon,
             segmenter=SplitSegmentation(split_index=split_index),
-            granularity=granularity,
+            granularity=1,
             sampler_name=_check_allowed_sampler(sampler_name),
             seed=seed,
             last_n=last_n,
@@ -238,8 +251,9 @@ def find_temporal_prune_depth(
         )
 
         feature_map = build_feature_map(inputs.x0)
+        feature_map_no_static = drop_static_features(feature_map)
 
-        groups = group_two_player_split(feature_map=feature_map)
+        groups = group_two_player_split(feature_map=feature_map_no_static)
 
         result = _explain_shap(
             model=model,
@@ -249,19 +263,21 @@ def find_temporal_prune_depth(
             num_perturbations=num_perturbations,
             seed=seed,
             inputs=inputs,
-            feature_map=feature_map,
+            feature_map=feature_map_no_static,
             groups=groups,
             player_names=["new", "old"],
         )
 
         values = dict(result)
-
         old_val = values["old"]
+
+        all_shap_values.append(old_val)
         # new_val = values["new"]
         # total = (abs(old_val) + abs(new_val))
         # old_share = abs(old_val) / total if total > 0 else 0.0
 
-        print(f"SHAP value for split_index {split_index}: {old_val}")
+        print(f"    SHAP value for split_index: {old_val}")
+
         """
         TODO threshold is compared to the real shap value, so how much the prediciton was moved.
         This means that the caller needs to know the model and its predicitons well enough
@@ -271,6 +287,7 @@ def find_temporal_prune_depth(
         Problems: Model can be probabilistc, so a lot of noice between calls that are not from the split
         """
         if abs(old_val) < threshold:
-            return split_index
+            #return split_index
+            continue # TODO just for testing
 
-    return 0
+    return 0, all_shap_values
