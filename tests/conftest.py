@@ -193,7 +193,7 @@ def output_path():
 
 @pytest.fixture
 def models_path():
-    return Path(__file__).parent.parent / "external_models"
+    return Path(__file__).parent / "fixture_models"
 
 
 @pytest.fixture
@@ -387,7 +387,10 @@ def database_url():
     project_root = Path(__file__).parent.parent
     db_dir = project_root / "target"
     db_dir.mkdir(exist_ok=True)
-    return f"sqlite:///{db_dir}/test.db"
+    # One file per xdist worker so parallel processes do not drop each other's tables
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    name = f"test_{worker}.db" if worker else "test.db"
+    return f"sqlite:///{db_dir}/{name}"
 
 
 @pytest.fixture(scope="session")
@@ -429,3 +432,107 @@ def make_test_df():
         return pd.DataFrame(rows)
 
     return _make
+
+
+@pytest.fixture
+def make_row_df():
+    """Factory for DataFrames with explicit per-row values.
+
+    Returns a callable _make(rows, columns=(...)) that builds a DataFrame from a list of row
+    tuples, one tuple per row, in the given column order.
+    """
+
+    def _make(rows, columns=("location", "time_period", "rainfall")):
+        return pd.DataFrame(rows, columns=list(columns))
+
+    return _make
+
+
+@pytest.fixture
+def alert_prediction():
+    """Stored forecast with two years of 10/20 cases: median 15 for each month."""
+    import datetime
+
+    from sqlalchemy import event
+    from sqlmodel import Session
+
+    from chap_core.assessment.thresholds.params import PercentileParams
+    from chap_core.database.alert_tables import AlertLevel, AlertPolicy
+    from chap_core.database.dataset_tables import DataSet, Observation
+    from chap_core.database.model_templates_and_config_tables import ConfiguredModelDB, ModelTemplateDB
+    from chap_core.database.tables import (
+        Backtest,
+        BacktestSpecification,
+        Prediction,
+        PredictionSamplesEntry,
+        PredictionSetup,
+    )
+
+    engine = create_engine("sqlite://")
+
+    @event.listens_for(engine, "connect")
+    def enable_foreign_keys(connection, _record):
+        connection.execute("PRAGMA foreign_keys=ON")
+
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        template = ModelTemplateDB(name="alert-model", version="1")
+        dataset = DataSet(
+            name="alert-history",
+            covariates=["disease_cases"],
+            observations=[
+                Observation(period=f"{year}-{month:02d}", org_unit=location, value=value, feature_name="disease_cases")
+                for location in ["A", "B"]
+                for year, value in [(2022, 10.0), (2023, 20.0)]
+                for month in range(1, 13)
+            ],
+        )
+        policy = AlertPolicy(
+            name="alert-policy",
+            levels=[
+                AlertLevel(
+                    name="monitor",
+                    threshold_params=PercentileParams(type="percentile", quantile=0.5),
+                    exceedance_threshold=0.5,
+                ),
+                AlertLevel(
+                    name="action",
+                    threshold_params=PercentileParams(type="percentile", quantile=1.0),
+                    exceedance_threshold=0.75,
+                ),
+            ],
+        )
+        session.add_all([template, dataset, policy])
+        session.flush()
+        model = ConfiguredModelDB(name="alert-model", model_template_id=template.id)
+        session.add(model)
+        session.flush()
+        backtest = Backtest(
+            dataset_id=dataset.id,
+            model_id=model.name,
+            model_db_id=model.id,
+            specification=BacktestSpecification(dataset_id=dataset.id),
+        )
+        session.add(backtest)
+        session.flush()
+        setup = PredictionSetup(
+            name="alert-setup", backtest_id=backtest.id, configured_model_id=model.id, alert_policy=policy
+        )
+        prediction = Prediction(
+            dataset_id=dataset.id,
+            model_id=model.name,
+            model_db_id=model.id,
+            prediction_setup=setup,
+            n_periods=2,
+            name="alert-prediction",
+            created=datetime.datetime.now(),
+            forecasts=[
+                PredictionSamplesEntry(org_unit="A", period="2024-01", values=[15.0, 16.0]),
+                PredictionSamplesEntry(org_unit="A", period="2024-02", values=[21.0, 21.0]),
+                PredictionSamplesEntry(org_unit="B", period="2024-01", values=[0.0, 15.0]),
+            ],
+        )
+        session.add(prediction)
+        session.commit()
+        yield session, prediction
+    engine.dispose()

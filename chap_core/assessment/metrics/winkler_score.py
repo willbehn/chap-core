@@ -61,6 +61,8 @@ class WinklerScore10_90Metric(WinklerScoreMetric):
         aggregation_op=AggregationOp.MEAN,
         description="Winkler score for 10th-90th percentile prediction interval",
         optimization_direction=OptimizationDirection.MINIMIZE,
+        proper_scoring_rule=True,
+        comparison_op="skill_ratio",
     )
     low_percentile = 10
     high_percentile = 90
@@ -76,6 +78,8 @@ class WinklerScore25_75Metric(WinklerScoreMetric):
         aggregation_op=AggregationOp.MEAN,
         description="Winkler score for 25th-75th percentile prediction interval",
         optimization_direction=OptimizationDirection.MINIMIZE,
+        proper_scoring_rule=True,
+        comparison_op="skill_ratio",
     )
     low_percentile = 25
     high_percentile = 75
@@ -118,6 +122,8 @@ class WinklerScore10_90Log1pMetric(WinklerScoreLog1pMetric):
         aggregation_op=AggregationOp.MEAN,
         description="Winkler score on log(1+x)-transformed values for 10-90 interval",
         optimization_direction=OptimizationDirection.MINIMIZE,
+        proper_scoring_rule=True,
+        comparison_op="skill_ratio",
     )
     low_percentile = 10
     high_percentile = 90
@@ -133,6 +139,8 @@ class WinklerScore25_75Log1pMetric(WinklerScoreLog1pMetric):
         aggregation_op=AggregationOp.MEAN,
         description="Winkler score on log(1+x)-transformed values for 25-75 interval",
         optimization_direction=OptimizationDirection.MINIMIZE,
+        proper_scoring_rule=True,
+        comparison_op="skill_ratio",
     )
     low_percentile = 25
     high_percentile = 75

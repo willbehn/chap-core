@@ -14,8 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Keep this block identical to the one in ci-test-external-models.yml;
-  # tests/test_ci_workflows.py checks that they do not drift apart.
+  # Keep this block identical to the one in ci-test-external-models.yml.
   changes:
     runs-on: ubuntu-latest
     outputs:
@@ -25,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           predicate-quantifier: every
           filters: |
@@ -44,16 +43,17 @@ jobs:
               - '!.github/CODEOWNERS'
               - '!.github/dependabot.yml'
               - '!.github/**/*.md'
+              - '!.claude/**'
 
   # Steps rather than the job are gated: the expanded matrix names are required
   # checks in the master ruleset, and a job skipped by a job-level `if` never
   # expands its matrix, so those checks would stay pending and block the merge.
   test:
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.13"]
     steps:
       - uses: actions/checkout@v7
@@ -63,7 +63,7 @@ jobs:
           echo "Service Account Private Key is set"
       - name: Install uv
         if: needs.changes.outputs.tests == 'true'
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@v10.3.0
       - name: Set up Python ${{ matrix.python-version }}
         if: needs.changes.outputs.tests == 'true'
         run: uv python install ${{ matrix.python-version }}

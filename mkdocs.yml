@@ -101,6 +101,7 @@ nav:
       - Overview: external_models/index.md
       - Getting Started:
           - For Experienced Modellers: external_models/experienced_modeller.md
+          - Build a Model from an MLproject File: external_models/mlproject_tutorial.md
 
       - Installing Chap Core:
           - Prepare for installation: external_models/prepare-for-installation.md
@@ -135,6 +136,7 @@ nav:
 
           - eval Reference: chap-cli/eval-reference.md
           - report Reference: chap-cli/report-reference.md
+          - simulate Reference: chap-cli/simulate-reference.md
           - explain-lime Reference: chap-cli/explain-lime-reference.md
 
   #- Modeling App:
@@ -155,6 +157,7 @@ nav:
           - MLproject Configuration: contributor/mlproject_configuration.md
           - Vocabulary: contributor/vocabulary.md
           - Testing: contributor/testing.md
+          - Pull Request Review: contributor/pr_review.md
           - Database Migrations: contributor/database_migrations.md
           - Documentation: contributor/writing_building_documentation.md
           - Development Tools: contributor/development_tools.md

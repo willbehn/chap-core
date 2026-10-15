@@ -5,12 +5,12 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import psycopg2
 import sqlalchemy
 from sqlalchemy.orm import selectinload
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel, col, create_engine, select
 from sqlmodel.sql.expression import SelectOfScalar
 
 from chap_core.api_types import BacktestParams
@@ -26,6 +26,8 @@ from .model_templates_and_config_tables import (
     ConfiguredModelDB,
     ModelConfiguration,
     ModelTemplateDB,
+    ModelTemplateRole,
+    chapkit_revision_conflict,
     compute_configuration_digest,
     drifted_template_content_fields,
 )
@@ -130,7 +132,16 @@ class SessionWrapper:
         logger.info(f"Adding model template: {model_template}")
         model_template.is_live = False
         self.session.add(model_template)
-        self.session.commit()
+        try:
+            self.session.commit()
+        except sqlalchemy.exc.IntegrityError:
+            # Concurrent chapkit registrations can insert the same version between the
+            # existence check and this commit. Losing that race re-reads the winner's row.
+            self.session.rollback()
+            existing_template = self._if_exists(model_template.name, model_template.version)
+            if existing_template is None:
+                raise
+            return self._return_model_template_id(model_template.name, existing_template)
         # return id
         return cast("int", model_template.id)
 
@@ -153,17 +164,9 @@ class SessionWrapper:
         model_name = model_template.name
         existing_template = self._if_exists(model_name, model_template.version)
         if existing_template:
-            if (
-                model_template.source_digest is not None
-                and existing_template.source_digest is not None
-                and model_template.source_digest != existing_template.source_digest
-            ):
-                logger.warning(
-                    f"Model template {model_name!r} version {model_template.version!r} came from "
-                    f"{existing_template.source_digest!r}, but its ref now points to "
-                    f"{model_template.source_digest!r}. CHAP keeps the first revision. Use a new "
-                    "version label to get the new source."
-                )
+            # The digest is never written to an existing row. The git seed and the service
+            # registry check the revision before they get here; a chapkit template seeded
+            # from a config file is only checked when it is loaded to run.
             drifted = drifted_template_content_fields(existing_template, model_template)
             if drifted:
                 logger.warning(
@@ -178,10 +181,47 @@ class SessionWrapper:
                 existing_template.archived = False
                 self.session.commit()
         else:
-            # add_model_template_from_url gives git templates a digest. Other sources give None.
+            # Git templates always give a digest. Chapkit services give one only when they
+            # report git_revision. The naive model and ad hoc templates give None.
             template_id = self._add_model_template(model_template)
         self._make_live_template_version(model_name, template_id)
         return template_id
+
+    def archive_model_template(self, model_template_id: int, all_versions: bool = False) -> None:
+        """Hide a template and its configured models from pickers. Rows stay, as backtests reference them.
+
+        With ``all_versions``, every version of the template's name is retired, which is
+        what taking a model out of a deployment means. Otherwise only this version is, and
+        retiring the live version hands live status back to the newest version that is not
+        retired and can run, so that undoing a failed update leaves the model as it was.
+        """
+        model_template = self.get_model_template(model_template_id)
+        if all_versions:
+            retired = list(
+                self.session.exec(select(ModelTemplateDB).where(ModelTemplateDB.name == model_template.name)).all()
+            )
+        else:
+            retired = [model_template]
+        for template in retired:
+            template.archived = True
+            for configured_model in template.configured_models:
+                configured_model.archived = True
+            self.session.add(template)
+        self.session.commit()
+        if all_versions or not model_template.is_live:
+            return
+        # Archived configured models still count on purpose: a version without an active one
+        # only needs a new configuration, which is better than leaving no version live.
+        runnable = self.session.exec(
+            select(ModelTemplateDB)
+            .join(ConfiguredModelDB, col(ConfiguredModelDB.model_template_id) == col(ModelTemplateDB.id))
+            .where(ModelTemplateDB.name == model_template.name, col(ModelTemplateDB.archived).is_(False))
+            .order_by(col(ModelTemplateDB.id).desc())
+        ).first()
+        if runnable is not None:
+            model_template.is_live = False
+            runnable.is_live = True
+            self.session.commit()
 
     def add_model_template_from_yaml_config(
         self, model_template_config: ModelTemplateConfigV2, source_digest: str | None = None
@@ -233,6 +273,8 @@ class SessionWrapper:
                 f"Configured model {name} with an identical configuration already exists. Returning existing id"
             )
             reactivated_model_id = cast("int", identical_configured_model.id)
+            # Re-adding an archived configuration shows it again.
+            identical_configured_model.archived = False
             # Still flip is_live so that re-adding a previous configuration makes it live again.
             self._make_live_configured_model(model_template_id, name, reactivated_model_id)
             self._make_live_template_version(template_name, model_template_id)
@@ -282,7 +324,22 @@ class SessionWrapper:
             .where(ConfiguredModelDB.is_live == True, ModelTemplateDB.is_live == True)
         )
 
-    def get_configured_models(self) -> list[ModelSpecRead]:
+    def get_baseline_models(self) -> list[ConfiguredModelDB]:
+        """The live configured models of baseline templates, one per baseline at its current version."""
+        return list(
+            self.session.exec(
+                self._select_live_configured_models().where(
+                    ModelTemplateDB.role == ModelTemplateRole.baseline,
+                    col(ModelTemplateDB.archived).is_(False),
+                    col(ConfiguredModelDB.archived).is_(False),
+                )
+            ).all()
+        )
+
+    def get_configured_models(
+        self,
+        template_health: dict[tuple[str, str | None], Literal["live", "revision_mismatch"]] | None = None,
+    ) -> list[ModelSpecRead]:
         # TODO: using ModelSpecRead for backwards compatibility, should in future return ConfiguredModelDB?
 
         # get configured models from db, excluding those with archived templates
@@ -322,6 +379,9 @@ class SessionWrapper:
             # NOTE: the sequence is important, starting with template data and add/overwrite with configured model data
             # ...in case of conflicting attrs, eg id and name
             merged_data = {**template_data, **configured_data}
+            if template_health is not None and configured_model.model_template.uses_chapkit:
+                template = configured_model.model_template
+                merged_data["health_status"] = template_health.get((template.name, template.version))
             configured_models_data.append(merged_data)
 
         # debug
@@ -483,11 +543,17 @@ class SessionWrapper:
             logger.info(f"Assuming chapkit model at {source_url}")
             assert source_url is not None
             template = ExternalChapkitModelTemplate(source_url)
+            # The service can change its code while CHAP runs, so check the revision it
+            # reports now against the one this template was stored from.
+            conflict = chapkit_revision_conflict(configured_model.model_template, template.get_reported_source_digest())
+            if conflict is not None:
+                template.close()
+                raise conflict
             logger.info(f"template: {template}")
             logger.info(f"configured_model: {configured_model}")
             return template.get_model(configured_model, prediction_length=prediction_length)  # type: ignore[arg-type, return-value]
         else:
-            logger.info(f"Assuming github model at {configured_model.model_template.source_url}")
+            logger.info(f"Loading model from {configured_model.model_template.source_url}")
             return cast(
                 "ConfiguredModel",
                 ModelTemplate.from_directory_or_github_url(
@@ -507,7 +573,7 @@ class SessionWrapper:
         self.session.commit()
 
     def get_or_create_backtest_specification(
-        self, dataset_id: int, params: BacktestParams, org_units: list[str]
+        self, dataset_id: int, params: BacktestParams, org_units: list[str], target_column: str = "disease_cases"
     ) -> BacktestSpecification:
         """Resolve the single specification row for these parameters, creating it if it is new.
 
@@ -516,7 +582,7 @@ class SessionWrapper:
         the unique constraint is expected and re-reads the winner's row rather than
         failing the backtest.
         """
-        params_by_name = params.model_dump()
+        params_by_name = {**params.model_dump(), "target_column": target_column}
 
         def existing() -> BacktestSpecification | None:
             query = select(BacktestSpecification).where(BacktestSpecification.dataset_id == dataset_id)
@@ -585,6 +651,7 @@ def _run_alembic_migrations(engine):
     """
     from alembic.config import Config
     from alembic.migration import MigrationContext
+    from alembic.script import ScriptDirectory
 
     from alembic import command
 
@@ -607,20 +674,37 @@ def _run_alembic_migrations(engine):
             alembic_cfg.attributes["connection"] = connection
 
             migration_context = MigrationContext.configure(connection)
-            if migration_context.get_current_revision() is None:
+            current_revision = migration_context.get_current_revision()
+            if current_revision is None:
                 existing_tables = set(sqlalchemy.inspect(connection).get_table_names())
                 if "modeltemplatedb" in existing_tables:
                     command.stamp(alembic_cfg, _GENERIC_SCHEMA_ALEMBIC_REVISION)
                     connection.commit()
+            else:
+                known_revisions = {
+                    script.revision for script in ScriptDirectory.from_config(alembic_cfg).walk_revisions()
+                }
+                if current_revision not in known_revisions:
+                    # A newer release migrated this database and the image was rolled back. Its
+                    # schema is a superset of this release's, so start without migrating.
+                    logger.warning(
+                        f"Database is at Alembic revision {current_revision}, which this release does not know. "
+                        "Skipping Alembic migrations."
+                    )
+                    return
 
             command.upgrade(alembic_cfg, "head")
+            # The revision check above autobegins a transaction on this connection, and
+            # Alembic does not commit a transaction it did not start.
+            connection.commit()
 
         logger.info("Completed Alembic migrations successfully")
 
     except Exception as e:
+        # Continuing on a partially migrated schema leaves alembic_version stalled and
+        # every later revision skipped, so startup has to fail here.
         logger.error(f"Error during Alembic migrations: {e}", exc_info=True)
-        # Don't raise - allow system to continue if Alembic fails
-        # This ensures backward compatibility
+        raise
 
 
 def create_db_and_tables():

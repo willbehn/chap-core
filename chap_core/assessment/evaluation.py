@@ -5,17 +5,18 @@ This module provides a database-agnostic interface for working with model
 evaluation results, enabling better code reuse between REST API and CLI workflows.
 """
 
+from __future__ import annotations
+
 import datetime
 import json
+import logging
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import pandas as pd
-import pandera.pandas as pa
 import xarray as xr
 from packaging.version import Version
 
@@ -31,14 +32,26 @@ from chap_core.assessment.weather_providers import (
     DEFAULT_WEATHER_PROVIDER_ID,
     LEGACY_WEATHER_PROVIDER_ID,
 )
-from chap_core.data import DataSet as _DataSet
 from chap_core.database.dataset_tables import DataSet, Observation, ObservationBase
-from chap_core.database.model_templates_and_config_tables import ConfiguredModelDB
 from chap_core.database.tables import Backtest, BacktestForecast, BacktestSpecification
-from chap_core.datatypes import SamplesWithTruth
-from chap_core.external.model_configuration import ModelTemplateConfigV2
+from chap_core.external.ExtendedPredictor import ExtendedPredictor
+from chap_core.hpo.types import FlatHyperparameterOptimization, HyperparameterOptimization
 from chap_core.rest_api.data_models import BacktestCreate
 from chap_core.time_period import Month, TimePeriod
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    import pandera.pandas as pa
+
+    from chap_core.assessment.prediction_evaluator import Estimator
+    from chap_core.data import DataSet as _DataSet
+    from chap_core.database.model_templates_and_config_tables import ConfiguredModelDB
+    from chap_core.datatypes import SamplesWithTruth
+    from chap_core.external.model_configuration import ModelTemplateConfigV2
+    from chap_core.hpo.meta_learner import MetaLearner
+
+logger = logging.getLogger(__name__)
 
 try:
     from chap_core import __version__ as CHAP_VERSION
@@ -46,7 +59,16 @@ except ImportError:
     CHAP_VERSION = "unknown"
 
 
-def _flat_data_to_xarray(flat_data: "FlatEvaluationData", model_metadata: dict) -> xr.Dataset:
+def _recorded_version(version: str | None) -> str | None:
+    """The version to persist: a real release version, or None for the "unknown" a dev checkout reports."""
+    return None if version in (None, "unknown") else version
+
+
+# Version stored on every backtest this process produces.
+RECORDED_CHAP_VERSION = _recorded_version(CHAP_VERSION)
+
+
+def _flat_data_to_xarray(flat_data: FlatEvaluationData, model_metadata: dict) -> xr.Dataset:
     """
     Convert FlatEvaluationData to xarray.Dataset.
 
@@ -105,12 +127,15 @@ def _flat_data_to_xarray(flat_data: "FlatEvaluationData", model_metadata: dict) 
     if "model_info" in model_metadata:
         attrs["model_info"] = model_metadata["model_info"]
 
+    if flat_data.hpo is not None:
+        attrs["hpo"] = json.dumps(asdict(flat_data.hpo))
+
     ds.attrs.update(attrs)
 
     return ds
 
 
-def _xarray_to_flat_data(ds: xr.Dataset) -> "FlatEvaluationData":
+def _xarray_to_flat_data(ds: xr.Dataset) -> FlatEvaluationData:
     """
     Convert xarray.Dataset back to FlatEvaluationData.
 
@@ -154,10 +179,16 @@ def _xarray_to_flat_data(ds: xr.Dataset) -> "FlatEvaluationData":
         if not historical_df.empty:
             historical_observations = FlatObserved.validate(historical_df)
 
+    # Load HPO data if present (backwards compatible)
+    hpo = None
+    if "hpo" in ds.attrs:
+        hpo = FlatHyperparameterOptimization(**json.loads(ds.attrs["hpo"]))
+
     return FlatEvaluationData(
         forecasts=FlatForecasts.validate(forecasts_df),
         observations=FlatObserved.validate(observations_df),
         historical_observations=historical_observations,
+        hpo=hpo,
     )
 
 
@@ -179,6 +210,7 @@ class FlatEvaluationData:
     forecasts: pa.typing.DataFrame[FlatForecasts]
     observations: pa.typing.DataFrame[FlatObserved]
     historical_observations: pa.typing.DataFrame[FlatObserved] | None = None
+    hpo: FlatHyperparameterOptimization | None = None
 
 
 class EvaluationBase(ABC):
@@ -223,7 +255,7 @@ class EvaluationBase(ABC):
 
     @classmethod
     @abstractmethod
-    def from_backtest(cls, backtest: "Backtest") -> "EvaluationBase":
+    def from_backtest(cls, backtest: Backtest) -> EvaluationBase:
         """
         Create Evaluation from database Backtest object.
 
@@ -243,10 +275,10 @@ class EvaluationBase(ABC):
         evaluation_results: Iterable[_DataSet[SamplesWithTruth]],
         last_train_period: TimePeriod,
         configured_model: ConfiguredModelDB,
-        info: "BacktestCreate",
+        info: BacktestCreate,
         historical_observations: list[Observation] | None = None,
         historical_context_periods: int = 0,
-    ) -> "EvaluationBase": ...
+    ) -> EvaluationBase: ...
 
 
 class Evaluation(EvaluationBase):
@@ -259,9 +291,10 @@ class Evaluation(EvaluationBase):
 
     def __init__(
         self,
-        backtest: "Backtest",
+        backtest: Backtest,
         historical_observations: list[Observation] | None = None,
         historical_context_periods: int = 0,
+        hpo: HyperparameterOptimization | None = None,
     ):
         """
         Initialize Evaluation with a Backtest object.
@@ -275,6 +308,7 @@ class Evaluation(EvaluationBase):
         self._backtest = backtest
         self._historical_observations = historical_observations or []
         self._historical_context_periods = historical_context_periods
+        self._hpo = hpo
         self._flat_data_cache: FlatEvaluationData | None = None
 
     @property
@@ -287,7 +321,7 @@ class Evaluation(EvaluationBase):
         return self._backtest.future_weather_provider
 
     @classmethod
-    def from_backtest(cls, backtest: "Backtest") -> "Evaluation":
+    def from_backtest(cls, backtest: Backtest) -> Evaluation:
         """
         Create Evaluation from database Backtest object.
 
@@ -309,14 +343,19 @@ class Evaluation(EvaluationBase):
         historical_observations: list[Observation] | None = None,
         historical_context_periods: int = 0,
         specification: BacktestSpecification | None = None,
-    ) -> "Evaluation":
+        hpo: HyperparameterOptimization | None = None,
+    ) -> Evaluation:
         info.created = datetime.datetime.now()
         # The parameters live on the specification now and are computed fields on
         # Backtest, reading through the link. Excluding them here keeps that explicit;
         # passing them would be silently ignored rather than rejected.
         backtest = Backtest(
             **info.model_dump(exclude=set(BacktestParams.model_fields))
-            | {"model_db_id": configured_model.id, "model_template_version": configured_model.model_template.version}
+            | {
+                "model_db_id": configured_model.id,
+                "model_template_version": configured_model.model_template.version,
+                "chap_version": RECORDED_CHAP_VERSION,
+            }
         )
         # Callers persisting the backtest pass the deduplicated row resolved against the
         # database. The CLI paths build an in-memory evaluation only, so a detached
@@ -392,18 +431,21 @@ class Evaluation(EvaluationBase):
             backtest,
             historical_observations=historical_observations,
             historical_context_periods=historical_context_periods,
+            hpo=hpo,
         )
 
     @classmethod
     def create(
         cls,
         configured_model: ConfiguredModelDB,
-        estimator,
+        estimator: Estimator | MetaLearner,
         dataset: _DataSet,
         backtest_params: BacktestParams,
         backtest_name: str = "evaluation",
         historical_context_years: int = 6,
-    ) -> "Evaluation":
+        info: BacktestCreate | None = None,
+        specification: BacktestSpecification | None = None,
+    ) -> Evaluation:
         """
         Uses ``train_test_generator`` to create an expanding window split of the
         data. Create an Evaluation by running a backtest.
@@ -414,19 +456,27 @@ class Evaluation(EvaluationBase):
 
         Args:
             configured_model: Configured model database object with metadata
-            estimator: Model estimator instance ready for training/prediction
+            estimator: Model estimator instance ready for training/prediction. It is run
+                as given: wrap a model whose max_prediction_periods is below
+                ``backtest_params.n_periods`` with ``ExtendedPredictor.extend_to_horizon``
+                first. Only the model tuned from a HyperparameterOptimizer is wrapped here.
             dataset: Dataset to evaluate on
             backtest_params: Backtest execution parameters (n_periods, n_splits, stride)
             backtest_name: Name for the backtest (default: "evaluation")
             historical_context_years: Years of historical data to include for plotting
                 context (default: 6). Number of periods is calculated based on dataset
                 period type (e.g., 6 years = 312 weeks or 72 months).
+            info: Backtest metadata to record. Defaults to an in-memory backtest named
+                ``backtest_name`` (``dataset_id=0``), as used by the CLI.
+            specification: Specification row to attach, for callers that persist the backtest.
 
         Returns:
             Evaluation instance with backtest results
         """
         from chap_core.assessment.dataset_splitting import train_test_generator
         from chap_core.assessment.prediction_evaluator import backtest
+        from chap_core.hpo.hyperparameter_optimizer import HyperparameterOptimizer
+        from chap_core.hpo.meta_learner import MetaLearner
 
         train_set, test_generator = train_test_generator(
             dataset=dataset,
@@ -436,9 +486,23 @@ class Evaluation(EvaluationBase):
             future_weather_provider=backtest_params.future_weather_provider,
         )
 
+        hpo_data = None
+        if isinstance(estimator, HyperparameterOptimizer):
+            hpo_data = estimator.meta_learn(train_set)
+            model = estimator.model_template.get_model(
+                hpo_data.model_configuration,  # type: ignore[arg-type]
+                prediction_length=backtest_params.n_periods,
+            )
+            # The tuned model is built here, so callers cannot extend its horizon themselves.
+            tuned_estimator = ExtendedPredictor.extend_to_horizon(model(), backtest_params.n_periods)  # type: ignore[assignment]
+        elif isinstance(estimator, MetaLearner):
+            raise TypeError(f"Unsupported MetaLearner: {type(estimator).__name__}")
+        else:
+            tuned_estimator = estimator
+
         # Run backtest
         evaluation_results = backtest(
-            estimator=estimator,
+            estimator=tuned_estimator,
             train_set=train_set,
             test_generator=test_generator,
             n_test_sets=backtest_params.n_splits,
@@ -448,7 +512,7 @@ class Evaluation(EvaluationBase):
         # Prepare metadata
         last_train_period = train_set.period_range[-1]
 
-        backtest_info = BacktestCreate(
+        backtest_info = info or BacktestCreate(
             name=backtest_name,
             dataset_id=0,
             model_id=configured_model.id,
@@ -480,6 +544,8 @@ class Evaluation(EvaluationBase):
             info=backtest_info,
             historical_observations=historical_observations,
             historical_context_periods=historical_context_periods,
+            specification=specification,
+            hpo=hpo_data,
         )
 
     @classmethod
@@ -573,7 +639,7 @@ class Evaluation(EvaluationBase):
 
         return observations
 
-    def to_backtest(self) -> "Backtest":
+    def to_backtest(self) -> Backtest:
         """
         Get underlying database Backtest object.
 
@@ -593,8 +659,10 @@ class Evaluation(EvaluationBase):
         """
         if self._flat_data_cache is None:
             forecasts_df = convert_backtest_to_flat_forecasts(self._backtest.forecasts)
+            specification = self._backtest.specification
             observations_df = convert_backtest_observations_to_flat_observations(
-                cast("list[ObservationBase]", self._backtest.dataset.observations)
+                cast("list[ObservationBase]", self._backtest.dataset.observations),
+                target_column=specification.target_column if specification is not None else "disease_cases",
             )
 
             # Convert historical observations if present
@@ -610,6 +678,7 @@ class Evaluation(EvaluationBase):
                 forecasts=FlatForecasts.validate(forecasts_df),
                 observations=FlatObserved.validate(observations_df),
                 historical_observations=historical_observations,
+                hpo=self._hpo.to_flat() if self._hpo is not None else None,
             )
         return self._flat_data_cache
 
@@ -668,7 +737,7 @@ class Evaluation(EvaluationBase):
         ds.to_netcdf(filepath)
 
     @classmethod
-    def from_file(cls, filepath: str | Path) -> "Evaluation":
+    def from_file(cls, filepath: str | Path) -> Evaluation:
         """
         Load evaluation from NetCDF file.
 
@@ -696,6 +765,8 @@ class Evaluation(EvaluationBase):
             split_periods=split_periods,
             forecasts=[],
             dataset_id=0,
+            # The version of the writer, not of the process importing the file.
+            chap_version=_recorded_version(ds.attrs.get("chap_version")),
             # The stored file carries no parameters beyond the provider, so this is a
             # detached placeholder that keeps the parameter properties readable.
             specification=BacktestSpecification(
@@ -772,11 +843,21 @@ class Evaluation(EvaluationBase):
 
         ds.close()
 
-        return cls(
+        evaluation = cls(
             backtest,
             historical_observations=historical_observations,
             historical_context_periods=historical_context_periods,
+            hpo=None,
         )
+
+        evaluation._flat_data_cache = flat_data
+        if flat_data.hpo is not None:
+            logger.warning(
+                "HPO doesn't yet support converting flat representation back into HyperparameterOptimization, "
+                "but FlatHyperparameterOptimization will be available in flat data cache."
+            )
+
+        return evaluation
 
     @staticmethod
     def _ensure_backcompatibility(ds: xr.Dataset) -> xr.Dataset:
@@ -800,6 +881,9 @@ class Evaluation(EvaluationBase):
             ds.attrs["future_weather_provider"] = LEGACY_WEATHER_PROVIDER_ID
         return ds
 
+    def get_hpo(self) -> HyperparameterOptimization | None:
+        return self._hpo
+
 
 @dataclass
 class ModelCard:
@@ -811,7 +895,7 @@ class ModelCard:
 
     def __init__(
         self,
-        backtest: "Backtest",
+        backtest: Backtest,
         description: str | None = None,
     ):
         self.backtest = backtest

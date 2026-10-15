@@ -14,6 +14,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, EmailStr, Field, HttpUrl, field_validator
 
+from chap_core.external.github import COMMIT_SHA_PATTERN
+
 SLUG_PATTERN = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
 
 
@@ -28,10 +30,11 @@ class AssessedStatus(StrEnum):
 
 
 class PeriodType(StrEnum):
-    """Supported time period types for model predictions."""
+    """Supported time period types for model predictions (`any` accepts both weekly and monthly)."""
 
     weekly = "weekly"
     monthly = "monthly"
+    any = "any"
 
 
 class ModelMetadata(BaseModel):
@@ -82,7 +85,7 @@ class MLServiceInfo(ServiceInfo):
     model_metadata: ModelMetadata = Field(
         description="Author / documentation metadata for the model the service hosts."
     )
-    period_type: PeriodType = Field(description="Period granularity the model accepts (`weekly` or `monthly`).")
+    period_type: PeriodType = Field(description="Period granularity the model accepts (`weekly`, `monthly`, or `any`).")
     min_prediction_periods: int = Field(
         default=0, description="Minimum forecast horizon (in periods) the model supports."
     )
@@ -100,10 +103,25 @@ class MLServiceInfo(ServiceInfo):
     requires_geo: bool = Field(
         default=False, description="When True, the model needs a GeoJSON polygon set for spatial features."
     )
+    # Reported by chapkit 2.3 services. Defaulted so older services still validate.
+    target: str = Field(default="disease_cases", description="Name of the variable the model predicts.")
+    hpo_search_space: dict | None = Field(
+        default=None, description="Search space used by HPO when tuning the model's user options."
+    )
     # Build provenance reported by chapkit 2.0 services. Optional so 1.x services still validate.
     git_revision: str | None = Field(default=None, description="Commit the service image was built from.")
     chapkit_version: str | None = Field(default=None, description="chapkit version installed in the service.")
     servicekit_version: str | None = Field(default=None, description="servicekit version installed in the service.")
+
+    @field_validator("git_revision", mode="before")
+    @classmethod
+    def normalize_git_revision(cls, v: object) -> str | None:
+        """Keep only a real commit sha. Blank values and placeholders such as an unexpanded
+        build variable mean the revision is unknown, and unknown is stored as None."""
+        if not isinstance(v, str):
+            return None
+        v = v.strip()
+        return v.lower() if COMMIT_SHA_PATTERN.fullmatch(v) else None
 
 
 class RegistrationRequest(BaseModel):

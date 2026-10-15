@@ -1,15 +1,26 @@
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from typing import TYPE_CHECKING, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, computed_field, create_model, field_validator
 from pydantic.alias_generators import to_camel
 
 from chap_core.api_types import BacktestParams, FeatureCollectionModel
 from chap_core.assessment.weather_providers import DEFAULT_WEATHER_PROVIDER_ID, resolve_weather_provider
+from chap_core.database.alert_tables import AlertApproval, AlertBase, AlertLevel, AlertPolicyBase
 from chap_core.database.base_tables import DBModel
 from chap_core.database.dataset_tables import DataSetCreateInfo, ObservationBase
 from chap_core.database.model_templates_and_config_tables import (
     ModelTemplateInformation,
     ModelTemplateMetaData,
+    ModelTemplateRole,
 )
-from chap_core.database.tables import BacktestBase, BacktestForecast, BacktestMetric, BacktestRead, QuantileTarget
+from chap_core.database.tables import (
+    BacktestBase,
+    BacktestForecast,
+    BacktestMetric,
+    BacktestRead,
+    DataSetMeta,
+    QuantileTarget,
+)
 
 
 class PredictionBase(BaseModel):
@@ -128,6 +139,56 @@ class BacktestFull(BacktestRead):
     forecasts: list[BacktestForecast] = Field(description="Per-(period, org-unit) forecast rows for this backtest.")
 
 
+class BacktestSpecificationSummary(BacktestParams):
+    """One row of the specification list: the setup plus how much has been run under it, without the backtests."""
+
+    target_column: str = Field(default="disease_cases", description="Dataset column to evaluate as the target.")
+
+    id: int = Field(description="Primary key of the specification.")
+    dataset: DataSetMeta = Field(description="Slim summary of the dataset the specification evaluates against.")
+    org_unit_count: int = Field(description="Number of org units the evaluation runs over.")
+    backtest_count: int = Field(description="Number of backtests that ran under this specification.")
+
+
+class BacktestSpecificationRead(BacktestParams):
+    """A specification with every backtest under it: the benchmark leaderboard in one response."""
+
+    target_column: str = Field(default="disease_cases", description="Dataset column to evaluate as the target.")
+
+    id: int = Field(description="Primary key of the specification.")
+    dataset: DataSetMeta = Field(description="Slim summary of the dataset the specification evaluates against.")
+    org_units: list[str] = Field(description="Org units the evaluation runs over, resolved from the dataset.")
+    backtests: list[BacktestRead] = Field(
+        description="Every backtest that ran under this specification, newest first. Comparable by construction."
+    )
+
+
+# Derived from BacktestParams so a parameter added there is filterable without touching this
+# module, the same way the specification's uniqueness key is derived. Every field is optional
+# and has no default: an omitted parameter means "any value", never the parameter's default.
+if TYPE_CHECKING:
+
+    class BacktestSpecificationFilter(DBModel):
+        """Query parameters of the specification list. Dataset id plus the fields of `BacktestParams`."""
+
+        dataset_id: int | None
+        target_column: str | None
+
+else:
+    _filter_fields: dict[str, Any] = {
+        "dataset_id": (int | None, Field(default=None, description="Only specifications evaluating this dataset.")),
+        "target_column": (str | None, Field(default=None, description="Only specifications evaluating this column.")),
+    }
+    for _name, _field in BacktestParams.model_fields.items():
+        _filter_fields[_name] = (_field.annotation | None, Field(default=None, description=_field.description))
+    BacktestSpecificationFilter = create_model(
+        "BacktestSpecificationFilter",
+        __base__=DBModel,
+        __doc__="Query parameters of the specification list. Dataset id plus the fields of `BacktestParams`.",
+        **_filter_fields,
+    )
+
+
 class BacktestDomain(DBModel):
     """The set of org units + split periods a backtest covers — used by the UI to filter visualisations."""
 
@@ -171,11 +232,43 @@ class MakePredictionRequest(DatasetMakeRequest, PredictionParams):
 class MakeBacktestRequest(BacktestParams):
     """Request to backtest an already-imported dataset against a configured model."""
 
+    target_column: str = Field(default="disease_cases", description="Dataset column to evaluate as the target.")
+
     name: str = Field(description="Human-friendly name for the resulting backtest row.")
     model_id: int | str = Field(
         description="Configured model to backtest: either the integer primary key or the canonical string name.",
     )
     dataset_id: int = Field(description="Foreign key to the dataset the backtest evaluates against.")
+
+
+class MakeBacktestsRequest(BacktestParams):
+    """Request to run several configured models on one dataset under one set of evaluation parameters."""
+
+    target_column: str = Field(default="disease_cases", description="Dataset column to evaluate as the target.")
+
+    name: str = Field(description="Name of the run; each backtest is named `<name>/<configured model name>`.")
+    model_ids: list[int | str] = Field(
+        min_length=1,
+        description="Configured models to backtest, each either the integer primary key or the canonical name.",
+    )
+    dataset_id: int = Field(description="Foreign key to the dataset the backtests evaluate against.")
+
+
+class BacktestJob(DBModel):
+    """One queued backtest job of a multi-model run."""
+
+    configured_model_id: int = Field(description="Primary key of the configured model the job evaluates.")
+    job_id: str = Field(description="Identifier of the queued job; poll it via the jobs endpoints.")
+
+
+class MakeBacktestsResponse(DBModel):
+    """Response of a multi-model run: where the results will land and how to follow each job."""
+
+    specification_id: int = Field(
+        description="Id of the `BacktestSpecification` every backtest of the run files under; fetch the results "
+        "with `GET /v1/crud/backtest-specifications/{id}`."
+    )
+    jobs: list[BacktestJob] = Field(description="One queued job per requested model, in request order.")
 
 
 class MakeBacktestWithDataRequest(DatasetMakeRequest, BacktestParams):
@@ -216,11 +309,25 @@ class ModelTemplateRead(DBModel, ModelTemplateInformation, ModelTemplateMetaData
     )
     is_live: bool = Field(default=True, description="True for the version that CHAP serves for this template name.")
     archived: bool = Field(default=False, description="When True, the template is hidden from default pickers.")
-    health_status: str | None = Field(
-        default=None, description="Reported health status of the template, used by chapkit-hosted models."
+    health_status: Literal["live", "revision_mismatch"] | None = Field(
+        default=None,
+        description=(
+            "Health of the chapkit service behind the template: 'live' when it is registered and runs the "
+            "stored source revision, 'revision_mismatch' when it reports another revision (or none) under "
+            "the same version, so the template cannot run until the service bumps its version. None for "
+            "templates that are not chapkit-hosted or whose service is not registered."
+        ),
     )
     uses_chapkit: bool = Field(
         default=False, description="When True, the template is served by a chapkit REST endpoint."
+    )
+    role: ModelTemplateRole | None = Field(
+        default=None,
+        description=(
+            "'baseline' for models built into chap-core that every model is compared against, "
+            "'comparison' for marketplace models flagged to be compared against on request, "
+            "null for ordinary models."
+        ),
     )
 
     # The horizon fields were renamed to match chapkit. Both spellings are served so a
@@ -244,6 +351,19 @@ class ModelTemplateRead(DBModel, ModelTemplateInformation, ModelTemplateMetaData
     @property
     def max_prediction_length(self) -> int | None:
         return self.max_prediction_periods
+
+
+class ModelTemplateFromService(DBModel):
+    """Request body for storing a model template from a registered chapkit service."""
+
+    service_id: str = Field(description="Id the service registered under in the v2 service registry.")
+    role: Literal[ModelTemplateRole.comparison] | None = Field(
+        default=None,
+        description=(
+            "Role from the model's marketplace entry. 'comparison' flags the template as a comparison model; "
+            "null makes it an ordinary model. Baselines are built into chap-core and cannot be set here."
+        ),
+    )
 
 
 class ConfiguredModelInfoRead(DBModel):
@@ -303,11 +423,60 @@ class BacktestUpdate(DBModel):
     name: str | None = Field(default=None, description="New human-friendly name; `None` leaves it unchanged.")
 
 
+class AlertPolicyCreate(AlertPolicyBase):
+    """Request body for creating an alert policy.
+
+    Redeclares `levels` as required with at least one entry, so an empty ladder is
+    a schema error rather than something the service has to catch.
+    """
+
+    levels: list[AlertLevel] = Field(
+        min_length=1,
+        description="The tiers of this policy, e.g. a `monitor` level and an `action` level. "
+        "Names must be unique within a policy.",
+    )
+
+
+class AlertCreate(AlertBase):
+    """One alert to record.
+
+    Exactly :class:`~chap_core.database.alert_tables.AlertBase`: the release-gate
+    fields are deliberately not settable, so every alert starts in `pending`.
+    """
+
+
+class AlertsCreate(DBModel):
+    """Request body for recording a batch of alerts. One run raises many at once."""
+
+    alerts: list[AlertCreate] = Field(min_length=1, description="The alerts to record.")
+
+
+class AlertApprovalRequest(DBModel):
+    """Request body for moving a set of alerts through the release gate."""
+
+    alert_ids: list[int] = Field(min_length=1, description="Alerts to review, applied together.")
+    approved: AlertApproval = Field(
+        description="New gate state. `approved` clears the alerts for dissemination; `declined` records "
+        "a deliberate decision not to release them, so they do not return to the queue."
+    )
+    approved_by: str = Field(description="Identifier of whoever reviewed them.")
+
+
+class AlertIdsResponse(DBModel):
+    """Ids of the alerts a batch call created."""
+
+    ids: list[int] = Field(description="Primary keys of the created alerts, in request order.")
+
+
 class PredictionSetupCreate(DBModel):
     """Request body for creating a recurring prediction setup attached to a backtest."""
 
     backtest_id: int = Field(description="Foreign key to the parent `Backtest` the setup will run forward in time.")
     name: str = Field(description="Human-friendly name for the setup.")
+    alert_policy_id: int | None = Field(
+        default=None,
+        description="Foreign key to the `AlertPolicy` the setup raises alerts against; `None` means no alerting.",
+    )
     schedule_cron_expression: str | None = Field(
         default=None, description="Standard cron expression for when to run; `None` means manual-only."
     )
@@ -334,6 +503,9 @@ class PredictionSetupUpdate(DBModel):
     schedule_enabled: bool | None = Field(default=None, description="New enabled flag; `None` leaves it unchanged.")
     quantile_targets: list[QuantileTarget] | None = Field(
         default=None, description="New full quantile-targets list; `None` leaves it unchanged."
+    )
+    alert_policy_id: int | None = Field(
+        default=None, description="New alert policy to raise alerts against; `None` leaves it unchanged."
     )
 
 

@@ -10,16 +10,17 @@ from chap_core.api_types import BacktestParams
 from chap_core.assessment.evaluation import Evaluation
 from chap_core.assessment.forecast import forecast_ahead
 from chap_core.assessment.metrics import compute_all_aggregated_metrics_from_backtest
-from chap_core.assessment.prediction_evaluator import backtest as _backtest
 from chap_core.assessment.weather_providers import DEFAULT_WEATHER_PROVIDER_ID
 from chap_core.data import DataSet as InMemoryDataSet
 from chap_core.database.database import SessionWrapper
 from chap_core.database.dataset_manager import DataSetManager
 from chap_core.database.dataset_tables import DataSetCreateInfo, DataSource
+from chap_core.database.tables import BacktestSpecification
 from chap_core.datatypes import HealthPopulationData, create_tsdataclass
 from chap_core.log_config import get_status_logger
 from chap_core.rest_api.data_models import BacktestCreate, FetchRequest, PredictionParams
 from chap_core.rest_api.worker_functions import WorkerConfig, harmonize_health_dataset
+from chap_core.services.alert_service import raise_alerts_for_prediction
 from chap_core.spatio_temporal_data.temporal_dataclass import DataSet
 from chap_core.time_period import Month
 
@@ -74,6 +75,25 @@ def validate_and_filter_dataset_for_evaluation(
     return DataSet(new_data, metadata=dataset.metadata, polygons=dataset.polygons)
 
 
+def _use_as_disease_cases(dataset: DataSet, column: str) -> DataSet:
+    """Expose `column` as `disease_cases` for models and scoring, dropping the original one."""
+    if column not in dataset.field_names():
+        raise ValueError(f"Dataset has no target column {column!r}")
+    if column == "disease_cases":
+        return dataset
+    fields = {name: name for name in dataset.field_names() if name not in (column, "disease_cases")}
+    fields["disease_cases"] = column
+    data_class = create_tsdataclass(list(fields))
+    return DataSet(
+        {
+            location: data_class(data.time_period, **{new: getattr(data, old) for new, old in fields.items()})
+            for location, data in dataset.items()
+        },
+        polygons=dataset.polygons,
+        metadata=dataset.metadata,
+    )
+
+
 # @convert_dicts_to_models
 def run_backtest(
     info: BacktestCreate,
@@ -83,9 +103,15 @@ def run_backtest(
     n_retrain: int = _DEFAULT_PARAMS.n_retrain,
     session: SessionWrapper | None = None,
     future_weather_provider: str = DEFAULT_WEATHER_PROVIDER_ID,
+    target_column: str = "disease_cases",
+    baseline_database_url: str | None = None,
 ):
-    from chap_core.assessment.dataset_splitting import train_test_generator
+    """Run and store a backtest, and return its id.
 
+    With `baseline_database_url`, the baselines missing on the backtest's specification
+    are queued as soon as it is resolved. The REST endpoints pass it. Baseline runs do
+    not, so they never trigger more baseline runs.
+    """
     # NOTE: model_id arg from the user is actually the model's unique name identifier
     assert session is not None, "session is required"
     status_logger.info(f"Starting backtest for model '{info.model_id}' on dataset ID {info.dataset_id}")
@@ -97,12 +123,6 @@ def run_backtest(
     # reads `info.model_id` as a string (job metadata, logs, etc.) sees the
     # canonical value rather than the raw integer primary key.
     info.model_id = configured_model.name
-
-    # hack to get who ewars model to work, it requires n_peridos=3.
-    # todo: should be removed in future when system for model specific backtest params is implemented
-    if configured_model.model_template.name == "ewars_plus":
-        logger.warning("Forcing n_periods=3 for ewars_plus model")
-        n_periods = 3
 
     if n_periods is None:
         n_periods = _get_n_periods(dataset)
@@ -117,47 +137,41 @@ def run_backtest(
     info.future_weather_provider = future_weather_provider
 
     status_logger.info(f"Validating dataset with {len(list(dataset.locations()))} locations")
-    dataset = validate_and_filter_dataset_for_evaluation(
-        dataset,
-        target_name="disease_cases",
+    backtest_params = BacktestParams(
         n_periods=n_periods,
         n_splits=n_splits,
         stride=stride,
-    )
-    # Resolved once the dataset is filtered: which org units survive is part of what
-    # makes two backtests comparable, and the filter above reads the parameters.
-    specification = session.get_or_create_backtest_specification(
-        dataset_id=info.dataset_id,
-        params=BacktestParams(
-            n_periods=n_periods,
-            n_splits=n_splits,
-            stride=stride,
-            n_retrain=n_retrain,
-            future_weather_provider=future_weather_provider,
-        ),
-        org_units=list(dataset.locations()),
-    )
-    train_set, test_generator = train_test_generator(
-        dataset,
-        prediction_length=n_periods,
-        n_test_sets=n_splits,
-        stride=stride,
+        n_retrain=n_retrain,
         future_weather_provider=future_weather_provider,
     )
+    dataset, specification = resolve_backtest_specification(
+        session, dataset, info.dataset_id, backtest_params, target_column=target_column
+    )
+    if baseline_database_url is not None:
+        # Imported here because baseline_runs imports this module for its jobs.
+        from chap_core.rest_api.baseline_runs import request_baselines
+
+        assert specification.id is not None
+        # The baselines must never cost the user their own backtest.
+        try:
+            request_baselines(session, specification.id, baseline_database_url)
+        except Exception:
+            logger.warning(f"Could not request baselines for specification {specification.id}", exc_info=True)
+            session.session.rollback()
+    dataset = _use_as_disease_cases(dataset, target_column)
 
     status_logger.info(f"Running {n_splits} evaluation splits with prediction length {n_periods}")
     assert configured_model.id is not None, "configured_model.id is required"
     estimator = session.get_configured_model_with_code(configured_model.id, prediction_length=n_periods)
-    predictions_list = _backtest(
+    # Historical context is for CLI plots; persisted backtests reach it through their dataset.
+    evaluation = Evaluation.create(
+        configured_model=configured_model,
         estimator=estimator,
-        train_set=train_set,
-        test_generator=test_generator,
-        n_test_sets=n_splits,
-        n_retrain=n_retrain,
-    )
-    last_train_period = dataset.period_range[-1]
-    evaluation = Evaluation.from_samples_with_truth(
-        predictions_list, last_train_period, configured_model, info=info, specification=specification
+        dataset=dataset,
+        backtest_params=backtest_params,
+        historical_context_years=0,
+        info=info,
+        specification=specification,
     )
     backtest = evaluation.to_backtest()
     backtest.model_db_id = configured_model.id
@@ -181,6 +195,44 @@ def run_backtest(
     return db_id
 
 
+def resolve_backtest_specification(
+    session: SessionWrapper,
+    dataset: DataSet,
+    dataset_id: int,
+    params: BacktestParams,
+    target_column: str = "disease_cases",
+) -> tuple[DataSet, BacktestSpecification]:
+    """Filter the dataset for these parameters and resolve the specification a run of them files under.
+
+    The org units left after filtering are part of what makes two backtests comparable,
+    so the specification is resolved from the filtered dataset. Shared by `run_backtest`
+    and the multi-model endpoint, which resolves the specification up front so its id
+    can be returned before any job has run.
+    """
+    if target_column not in dataset.field_names():
+        raise ValueError(f"Dataset has no target column {target_column!r}")
+    dataset = validate_and_filter_dataset_for_evaluation(
+        dataset,
+        target_name=target_column,
+        n_periods=params.n_periods,
+        n_splits=params.n_splits,
+        stride=params.stride,
+    )
+    if not list(dataset.locations()):
+        raise ValueError(
+            "No org unit has target data left to train on: the evaluation window "
+            f"(n_periods={params.n_periods}, n_splits={params.n_splits}, stride={params.stride}) "
+            "covers the whole dataset."
+        )
+    specification = session.get_or_create_backtest_specification(
+        dataset_id=dataset_id,
+        params=params,
+        org_units=list(dataset.locations()),
+        target_column=target_column,
+    )
+    return dataset, specification
+
+
 def run_prediction(
     model_id: str,
     dataset_id: str,
@@ -190,11 +242,13 @@ def run_prediction(
     prediction_setup_id: int | None = None,
     configured_model_id: int | None = None,
     future_weather_provider: str = DEFAULT_WEATHER_PROVIDER_ID,
+    target_column: str = "disease_cases",
 ):
     # NOTE: model_id arg from the user is actually the model's unique name identifier
     status_logger.info(f"Starting prediction for model '{model_id}' on dataset ID {dataset_id}")
 
     dataset = DataSetManager(session.session).to_dataset(int(dataset_id))
+    dataset = _use_as_disease_cases(dataset, target_column)
     if n_periods is None:
         n_periods = _get_n_periods(dataset)
 
@@ -217,6 +271,8 @@ def run_prediction(
     )
     assert db_id is not None
     status_logger.info(f"Prediction completed successfully. Results saved with ID {db_id}")
+    if prediction_setup_id is not None:
+        raise_alerts_for_prediction(session.session, db_id)
     return db_id
 
 
@@ -227,7 +283,7 @@ def harmonize_and_add_health_dataset(
     dataset_obj = InMemoryDataSet.from_dict(health_dataset, HealthPopulationData)  # type: ignore[arg-type]
     dataset = harmonize_health_dataset(dataset_obj, usecwd_for_credentials=False, worker_config=worker_config)
     db_id: int = DataSetManager(session.session).save_dataset(
-        DataSetCreateInfo(name=name), dataset, polygons=dataset_obj.polygons.model_dump_json()
+        DataSetCreateInfo(name=name), dataset, polygons=dataset_obj.polygons.model_dump_json(), created_manually=True
     )
     status_logger.info(f"Dataset '{name}' added successfully with ID {db_id}")
     return db_id
@@ -254,7 +310,7 @@ def harmonize_and_add_dataset(
         full_dataset = dataset_obj
     info = DataSetCreateInfo(name=name, type=ds_type, data_sources=data_sources or [])
     db_id: int = DataSetManager(session.session).save_dataset(
-        info, full_dataset, polygons=dataset_obj.polygons.model_dump_json()
+        info, full_dataset, polygons=dataset_obj.polygons.model_dump_json(), created_manually=True
     )
     status_logger.info(f"Dataset '{name}' added successfully with ID {db_id}")
     return db_id
@@ -277,6 +333,7 @@ def predict_pipeline_from_composite_dataset(
     worker_config=WorkerConfig(),
     prediction_setup_id: int | None = None,
     configured_model_id: int | None = None,
+    target_column: str = "disease_cases",
 ) -> int:
     """
     This is the main pipeline function to run prediction from a dataset.
@@ -297,6 +354,7 @@ def predict_pipeline_from_composite_dataset(
         prediction_setup_id=prediction_setup_id,
         configured_model_id=configured_model_id,
         future_weather_provider=prediction_params.future_weather_provider,
+        target_column=target_column,
     )
     return result
 
@@ -311,15 +369,13 @@ def run_backtest_from_dataset(
     backtest_params: BacktestParams,
     session: SessionWrapper,
     worker_config=WorkerConfig(),
+    baseline_database_url: str | None = None,
 ) -> int:
     ds = InMemoryDataSet.from_dict(provided_data_model_dump, create_tsdataclass(feature_names))
     dataset_id = DataSetManager(session.session).save_dataset(
         dataset_info=dataset_info, orig_dataset=ds, polygons=ds.polygons.model_dump_json()
     )
     backtest_create_info = BacktestCreate(name=backtest_name, dataset_id=dataset_id, model_id=model_id)
-    if ds.frequency == "W" and backtest_params.stride < 4:
-        logging.warning("Setting stride to 4 since its weekly data")
-        backtest_params.stride = 4
     result: int = run_backtest(
         info=backtest_create_info,
         n_periods=backtest_params.n_periods,
@@ -328,5 +384,6 @@ def run_backtest_from_dataset(
         n_retrain=backtest_params.n_retrain,
         session=session,
         future_weather_provider=backtest_params.future_weather_provider,
+        baseline_database_url=baseline_database_url,
     )
     return result

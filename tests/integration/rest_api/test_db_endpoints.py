@@ -9,12 +9,18 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
+import chap_core
 from chap_core.api_types import DataList, EvaluationEntry, PredictionEntry
 from chap_core.database.database import SessionWrapper
 from chap_core.datatypes import create_tsdataclass
 from chap_core.database.dataset_manager import DataSetManager
-from chap_core.database.model_templates_and_config_tables import ConfiguredModelDB
-from chap_core.database.dataset_tables import DataSet, DataSetCreateInfo, DataSetWithObservations, ObservationBase
+from chap_core.database.model_templates_and_config_tables import ConfiguredModelDB, ModelTemplateRole
+from chap_core.database.dataset_tables import (
+    DataSet,
+    DataSetWithObservations,
+    Observation,
+    ObservationBase,
+)
 from chap_core.database.model_spec_tables import ModelSpecRead
 from chap_core.database.tables import (
     Backtest,
@@ -26,11 +32,9 @@ from chap_core.database.tables import (
 )
 from chap_core.rest_api.data_models import (
     BacktestCreate,
-    BacktestFull,
     ConfiguredModelInfoRead,
     DatasetCreate,
     DatasetMakeRequest,
-    FetchRequest,
     MakePredictionRequest,
     ModelConfigurationCreate,
     ModelTemplateRead,
@@ -38,6 +42,7 @@ from chap_core.rest_api.data_models import (
 from chap_core.rest_api.app import app
 from chap_core.spatio_temporal_data.converters import observations_to_dataset
 from chap_core.rest_api.db_worker_functions import harmonize_and_add_dataset, run_backtest
+from chap_core.time_period import TimePeriod
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -96,55 +101,6 @@ def test_visualization_endpoints_404_on_missing_ids(clean_engine, dependency_ove
         assert response.status_code == 404, response.text
 
 
-# @pytest.mark.slow
-@pytest.mark.parametrize("do_filter", [True, False])
-@pytest.mark.slow
-@pytest.mark.skip(reason="not in use")
-def test_backtest_flow(celery_session_worker, clean_engine, dependency_overrides, weekly_full_data, do_filter):
-    with SessionWrapper(clean_engine) as session:
-        dataset_id = DataSetManager(session.session).save_dataset(
-            DataSetCreateInfo(name="full_data", type="evaluation"), weekly_full_data, "polygons"
-        )
-    response = client.post(
-        "/v1/analytics/create-backtest", json={"datasetId": dataset_id, "modelId": "naive_model", "name": "x"}
-    )
-    assert response.status_code == 200, response.json()
-    job_id = response.json()["id"]
-    db_id = await_result_id(job_id)
-    response = client.get(f"/v1/crud/backtests/{db_id}")
-
-    # just make sure the datasets are valid
-    dataset_response = client.get("/v1/crud/datasets")
-
-    assert response.status_code == 200, response.json()
-    BacktestFull.model_validate(response.json())
-    split_period, org_units = None, []
-    if do_filter:
-        split_period = "2022W30"
-        org_units = ["granada"]
-
-    params = {"backtestId": db_id, "quantiles": [0.1, 0.5, 0.9]}
-    if do_filter:
-        params |= {"splitPeriod": split_period, "orgUnits": org_units}
-
-    response = client.get("/v1/analytics/evaluation-entry", params=params)
-
-    assert response.status_code == 200, response.json()
-    evaluation_entries = response.json()
-    params = {} if not do_filter else {"orgUnits": org_units}
-    actual_cases_response = client.get(f"/v1/analytics/actualCases/{db_id}", params=params)
-    assert actual_cases_response.status_code == 200, actual_cases_response.json()
-    actual_cases = DataList.model_validate(actual_cases_response.json())
-    for entry in evaluation_entries:
-        assert "splitPeriod" in entry, f"splitPeriod not in entry: {entry.keys()}"
-        entry = EvaluationEntry.model_validate(entry)
-        if do_filter:
-            assert entry.splitPeriod == split_period, (entry.split_period, split_period)
-            assert entry.orgUnit in org_units, (entry.org_unit, org_units)
-    if do_filter:
-        assert {entry["orgUnit"] for entry in evaluation_entries} == set(org_units), (evaluation_entries, org_units)
-
-
 def test_add_non_full_dataset(celery_session_worker, clean_engine, dependency_overrides, local_data_path):
     filepath = local_data_path / "test_data/make_dataset_failing_request.json"
 
@@ -167,6 +123,7 @@ def test_add_dataset_flow(celery_session_worker, dependency_overrides, dataset_c
     ds = DataSetWithObservations.model_validate(response.json())
 
     assert len(ds.observations) > 0
+    assert ds.created_manually
     print(response.json())
     assert "orgUnit" in response.json()["observations"][0], response.json()["observations"][0].keys()
 
@@ -244,6 +201,7 @@ def test_make_dataset_import_persists_data_sources(clean_engine, dataset_make_re
         stored = session.session.get(DataSet, dataset_id)
         assert stored is not None
         assert stored.data_sources == request.data_sources
+        assert stored.created_manually
 
 
 def test_get_data_sources():
@@ -525,6 +483,110 @@ def test_create_backtest_forwards_params_and_accepts_int_model_id(override_sessi
     assert (captured["n_periods"], captured["n_splits"], captured["stride"], captured["n_retrain"]) == (3, 4, 1, 2)
 
 
+class _JobIdWorker:
+    """Records every queued job and hands out distinct job ids, so a test can check what was submitted."""
+
+    def __init__(self):
+        self.queued: list[tuple] = []
+
+    def queue_db(self, func, info, **kwargs):
+        self.queued.append((func, info, kwargs))
+
+        class _Job:
+            id = f"job-{len(self.queued)}"
+
+        return _Job()
+
+
+def test_create_backtests_resolves_the_specification_and_queues_one_job_per_model(
+    override_session, seeded_session, p_seeded_engine, monkeypatch
+):
+    """The response must name the specification the jobs will file under before any job has run,
+    and the benchmarking server must get one job id per model without a second lookup."""
+    from chap_core.rest_api.v1.routers import analytics
+
+    worker = _JobIdWorker()
+    monkeypatch.setattr(analytics, "worker", worker)
+    naive = seeded_session.exec(select(ConfiguredModelDB).where(ConfiguredModelDB.name == "naive_model")).one()
+    other = seeded_session.exec(select(ConfiguredModelDB).where(ConfiguredModelDB.name != "naive_model")).first()
+    dataset_id = seeded_session.exec(select(DataSet.id)).first()
+
+    payload = {
+        "name": "bench",
+        "datasetId": dataset_id,
+        "modelIds": ["naive_model", other.id],
+        "nSplits": 4,
+        "nRetrain": 2,
+    }
+    response = client.post("/v1/analytics/create-backtests", json=payload)
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert [job["configuredModelId"] for job in data["jobs"]] == [naive.id, other.id]
+    assert [job["jobId"] for job in data["jobs"]] == ["job-1", "job-2"]
+
+    assert [info.name for _, info, _ in worker.queued] == [f"bench/{naive.name}", f"bench/{other.name}"]
+    assert [info.model_id for _, info, _ in worker.queued] == [naive.id, other.id]
+    for func, _, kwargs in worker.queued:
+        assert func is run_backtest
+        assert (kwargs["n_periods"], kwargs["n_splits"], kwargs["stride"], kwargs["n_retrain"]) == (3, 4, 1, 2)
+        assert kwargs["baseline_database_url"] == kwargs["database_url"]
+
+    specification = client.get(f"/v1/crud/backtest-specifications/{data['specificationId']}").json()
+    assert (specification["dataset"]["id"], specification["nSplits"], specification["nRetrain"]) == (dataset_id, 4, 2)
+    assert specification["backtests"] == []
+    # A worker running one of the queued jobs files its backtest under the returned id.
+    with SessionWrapper(p_seeded_engine) as session:
+        backtest_id = _run(session, f"bench/{naive.name}", dataset_id, n_periods=3, n_splits=4, stride=1, n_retrain=2)
+        assert session.session.get(Backtest, backtest_id).specification_id == data["specificationId"]
+
+
+def test_create_backtests_rejects_unknown_dataset_or_model_before_queueing(
+    override_session, seeded_session, monkeypatch
+):
+    from chap_core.rest_api.v1.routers import analytics
+
+    worker = _JobIdWorker()
+    monkeypatch.setattr(analytics, "worker", worker)
+    dataset_id = seeded_session.exec(select(DataSet.id)).first()
+
+    response = client.post(
+        "/v1/analytics/create-backtests", json={"name": "x", "datasetId": 999999, "modelIds": ["naive_model"]}
+    )
+    assert response.status_code == 404, response.text
+    response = client.post(
+        "/v1/analytics/create-backtests",
+        json={"name": "x", "datasetId": dataset_id, "modelIds": ["naive_model", "no_such_model"]},
+    )
+    assert response.status_code == 404, response.text
+    assert "no_such_model" in response.json()["detail"]
+    response = client.post(
+        "/v1/analytics/create-backtests", json={"name": "x", "datasetId": dataset_id, "modelIds": []}
+    )
+    assert response.status_code == 422, response.text
+    assert worker.queued == []
+
+
+def test_create_backtests_rejects_a_window_that_leaves_no_org_unit_to_train_on(
+    override_session, seeded_session, monkeypatch
+):
+    """The endpoint filters the dataset before queueing, so it can refuse up front instead of
+    creating an empty specification and one doomed job per model."""
+    from chap_core.rest_api.v1.routers import analytics
+
+    worker = _JobIdWorker()
+    monkeypatch.setattr(analytics, "worker", worker)
+    dataset_id = seeded_session.exec(select(DataSet.id)).first()
+
+    payload = {"name": "x", "datasetId": dataset_id, "modelIds": ["naive_model"], "nSplits": 1000}
+    response = client.post("/v1/analytics/create-backtests", json=payload)
+    assert response.status_code == 422, response.text
+    assert "No org unit" in response.json()["detail"]
+    assert worker.queued == []
+    assert (
+        client.get("/v1/crud/backtest-specifications", params={"datasetId": dataset_id, "nSplits": 1000}).json() == []
+    )
+
+
 def test_run_backtest_persists_resolved_params(override_session, p_seeded_engine):
     """The stored row records the parameters that actually ran: n_periods=None is
     resolved from the (monthly) dataset, and an integer model id is resolved to its name."""
@@ -575,6 +637,20 @@ def _run(session, name, dataset_id, **params):
     )
 
 
+def test_run_backtest_records_the_train_cutoff_not_the_dataset_end(p_seeded_engine):
+    """`last_train_period` is the end of the training window, so it must precede every
+    period forecast from it. Using the end of the full dataset instead puts the cutoff
+    after the held-out window and makes horizon distances come out wrong."""
+    with SessionWrapper(p_seeded_engine) as session:
+        dataset_id = session.session.exec(select(DataSet.id)).first()
+        backtest_id = _run(session, "cutoff", dataset_id, n_periods=3, n_splits=2, stride=1)
+        forecasts = session.session.get(Backtest, backtest_id).forecasts
+        assert forecasts
+        assert all(TimePeriod.parse(f.last_train_period) < TimePeriod.parse(f.period) for f in forecasts), (
+            "last_train_period must be before the forecast period"
+        )
+
+
 def test_backtests_with_the_same_parameters_share_one_specification(p_seeded_engine):
     """Deduplication is what makes "these two results are comparable" structural."""
     with SessionWrapper(p_seeded_engine) as session:
@@ -585,6 +661,17 @@ def test_backtests_with_the_same_parameters_share_one_specification(p_seeded_eng
 
         assert first.specification_id == second.specification_id
         assert (first.n_periods, first.n_splits, first.stride, first.n_retrain) == (3, 2, 1, 1)
+
+
+def test_backtest_records_the_chap_version_that_produced_it(p_seeded_engine):
+    """Without this a metric shift over time cannot be attributed to the model or the platform."""
+    with SessionWrapper(p_seeded_engine) as session:
+        dataset_id = session.session.exec(select(DataSet.id)).first()
+        backtest = session.session.get(Backtest, _run(session, "versioned", dataset_id, n_periods=3, n_splits=2))
+
+        # A dev checkout without package metadata reports "unknown", which is not a version.
+        expected = None if chap_core.__version__ == "unknown" else chap_core.__version__
+        assert backtest.chap_version == expected
 
 
 def test_every_backtest_parameter_is_part_of_the_uniqueness_key():
@@ -601,7 +688,11 @@ def test_every_backtest_parameter_is_part_of_the_uniqueness_key():
         for c in BacktestSpecification.__table__.constraints
         if getattr(c, "name", None) == "uq_backtestspecification_params"
     )
-    assert {column.name for column in constraint.columns} == {"dataset_id", *BacktestParams.model_fields}
+    assert {column.name for column in constraint.columns} == {
+        "dataset_id",
+        "target_column",
+        *BacktestParams.model_fields,
+    }
 
 
 def test_differing_parameters_produce_different_specifications(p_seeded_engine):
@@ -612,6 +703,40 @@ def test_differing_parameters_produce_different_specifications(p_seeded_engine):
 
         assert two_splits.specification_id != three_splits.specification_id
         assert (two_splits.n_splits, three_splits.n_splits) == (2, 3)
+
+
+def test_target_column_is_scored_and_separates_specifications(override_session, p_seeded_engine):
+    from chap_core.assessment.evaluation import Evaluation
+
+    with SessionWrapper(p_seeded_engine) as session:
+        dataset_id = session.session.exec(select(DataSet.id)).first()
+        for observation in session.session.exec(select(Observation).where(Observation.feature_name == "rainfall")):
+            observation.value = 7.0
+        session.session.commit()
+        params = {"n_periods": 3, "n_splits": 2}
+        default = session.session.get(Backtest, _run(session, "default", dataset_id, **params))
+        rainfall = session.session.get(Backtest, _run(session, "rain", dataset_id, target_column="rainfall", **params))
+
+        assert default.specification_id != rainfall.specification_id
+        assert set(Evaluation.from_backtest(rainfall).to_flat().observations.disease_cases) == {7.0}
+    rows = client.get("/v1/crud/backtest-specifications", params={"targetColumn": "rainfall"}).json()
+    assert [row["id"] for row in rows] == [rainfall.specification_id]
+    actual_cases = DataList.model_validate(client.get(f"/v1/analytics/actual-cases/{rainfall.id}").json())
+    assert {entry.value for entry in actual_cases.data} == {7.0}
+
+
+@pytest.mark.parametrize("endpoint", ["create-backtest", "create-backtests"])
+def test_create_backtest_rejects_unknown_target_column(override_session, seeded_session, monkeypatch, endpoint):
+    from chap_core.rest_api.v1.routers import analytics
+
+    worker = _JobIdWorker()
+    monkeypatch.setattr(analytics, "worker", worker)
+    dataset_id = seeded_session.exec(select(DataSet.id)).first()
+    payload = {"name": "x", "datasetId": dataset_id, "modelId": "naive_model", "modelIds": ["naive_model"]}
+
+    response = client.post(f"/v1/analytics/{endpoint}", json={**payload, "targetColumn": "missing"})
+    assert response.status_code == 422, response.text
+    assert worker.queued == []
 
 
 def test_differing_weather_providers_produce_different_specifications(p_seeded_engine):
@@ -657,6 +782,121 @@ def test_specification_org_units_are_the_ones_left_after_filtering(p_seeded_engi
         assert set(backtest.specification.org_units) == set(backtest.org_units)
 
 
+def test_specification_filter_covers_every_backtest_parameter():
+    """A parameter missing from the filter could not be part of the lookup tuple, so an
+    external system could not find its specification again. Every field must also be
+    optional with no default: an omitted parameter means any value, not the default."""
+    from chap_core.api_types import BacktestParams
+    from chap_core.rest_api.data_models import BacktestSpecificationFilter
+
+    assert set(BacktestSpecificationFilter.model_fields) == {
+        "dataset_id",
+        "target_column",
+        *BacktestParams.model_fields,
+    }
+    assert all(field.default is None for field in BacktestSpecificationFilter.model_fields.values())
+
+
+def test_list_backtest_specifications_filters_by_dataset_and_parameters(
+    override_session, p_seeded_engine, backtest_params, org_units
+):
+    """The seeded database holds two specifications with the same parameters on two datasets."""
+    response = client.get("/v1/crud/backtest-specifications")
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert len(rows) == 2, rows
+    assert len({row["dataset"]["id"] for row in rows}) == 2, rows
+    assert all(row["backtestCount"] == 1 and row["orgUnitCount"] == len(org_units) for row in rows), rows
+    assert all("backtests" not in row for row in rows)
+
+    by_dataset = client.get("/v1/crud/backtest-specifications", params={"datasetId": rows[0]["dataset"]["id"]}).json()
+    assert [row["id"] for row in by_dataset] == [rows[0]["id"]]
+
+    full_tuple = {"datasetId": rows[0]["dataset"]["id"], **backtest_params.model_dump(by_alias=True)}
+    assert [row["id"] for row in client.get("/v1/crud/backtest-specifications", params=full_tuple).json()] == [
+        rows[0]["id"]
+    ]
+    assert client.get("/v1/crud/backtest-specifications", params={**full_tuple, "nSplits": 99}).json() == []
+
+
+def test_get_backtest_specification_returns_its_backtests_newest_first(override_session, p_seeded_engine):
+    with SessionWrapper(p_seeded_engine) as session:
+        dataset_id = session.session.exec(select(DataSet.id)).first()
+        params = {"n_periods": 3, "n_splits": 2, "stride": 1, "n_retrain": 1}
+        first_id = _run(session, "first", dataset_id, **params)
+        second_id = _run(session, "second", dataset_id, **params)
+        specification_id = session.session.get(Backtest, first_id).specification_id
+        # The seeded backtest has the same parameters, so it sits on the same
+        # specification; it predates `created`, which must not push it to the top.
+        seeded_id = session.session.exec(select(Backtest.id).where(Backtest.name == "test backtest")).one()
+
+    response = client.get(f"/v1/crud/backtest-specifications/{specification_id}")
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["id"] == specification_id
+    assert data["dataset"]["id"] == dataset_id
+    assert (data["nPeriods"], data["nSplits"]) == (3, 2)
+    assert data["orgUnits"]
+    assert [b["id"] for b in data["backtests"]] == [second_id, first_id, seeded_id]
+    for row in data["backtests"]:
+        BacktestRead.model_validate(row)
+        assert row["specificationId"] == specification_id
+        assert row["configuredModel"]["configurationDigest"]
+        assert row["configuredModel"]["modelTemplate"]["name"]
+        assert isinstance(row["aggregateMetrics"], dict)
+        assert "forecasts" not in row
+
+    assert client.get("/v1/crud/backtest-specifications/999999").status_code == 404
+
+
+def test_list_backtests_filters_by_specification_and_dataset(override_session, p_seeded_engine):
+    with SessionWrapper(p_seeded_engine) as session:
+        dataset_id = session.session.exec(select(DataSet.id)).first()
+        params = {"n_periods": 3, "n_splits": 2, "stride": 1, "n_retrain": 1}
+        first_id = _run(session, "first", dataset_id, **params)
+        second_id = _run(session, "second", dataset_id, **params)
+        other_id = _run(session, "other", dataset_id, **{**params, "n_splits": 3})
+        specification_id = session.session.get(Backtest, first_id).specification_id
+
+    by_specification = client.get("/v1/crud/backtests", params={"specificationId": specification_id}).json()
+    assert {first_id, second_id} <= {b["id"] for b in by_specification}
+    assert other_id not in {b["id"] for b in by_specification}
+    assert all(b["specificationId"] == specification_id for b in by_specification)
+
+    by_dataset = client.get("/v1/crud/backtests", params={"datasetId": dataset_id}).json()
+    assert {first_id, second_id, other_id} <= {b["id"] for b in by_dataset}
+    assert all(b["datasetId"] == dataset_id for b in by_dataset)
+
+
+def test_backtest_listings_hide_baseline_backtests(override_session, p_seeded_engine):
+    with SessionWrapper(p_seeded_engine) as session:
+        dataset_id = session.session.exec(select(DataSet.id)).first()
+        params = {"n_periods": 3, "n_splits": 2, "stride": 1, "n_retrain": 1}
+        baseline_id = _run(session, "baseline", dataset_id, **params)
+        # Same regions and splits, so without the filter it would list the baseline as compatible.
+        other_id = _run(session, "other", dataset_id, **params)
+        backtest = session.session.get(Backtest, baseline_id)
+        specification_id = backtest.specification_id
+        template = backtest.configured_model.model_template
+        template.role = ModelTemplateRole.baseline
+        session.session.add(template)
+        session.session.commit()
+
+    # The backtest is still there, and it carries the role of its template.
+    response = client.get(f"/v1/crud/backtests/{baseline_id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["configuredModel"]["modelTemplate"]["role"] == "baseline"
+
+    assert baseline_id not in {b["id"] for b in client.get("/v1/crud/backtests").json()}
+    specification = client.get(f"/v1/crud/backtest-specifications/{specification_id}").json()
+    assert baseline_id not in {b["id"] for b in specification["backtests"]}
+    summaries = client.get("/v1/crud/backtest-specifications").json()
+    counts = {row["id"]: row["backtestCount"] for row in summaries}
+    assert counts.get(specification_id, 0) == len(specification["backtests"])
+    compatible = client.get(f"/v1/analytics/compatible-backtests/{other_id}").json()
+    assert baseline_id not in {b["id"] for b in compatible}
+
+
 def test_backtest_read_still_exposes_the_parameters_flat(override_session, p_seeded_engine):
     """The parameters moved behind a relationship; the wire shape must not have moved with them."""
     with SessionWrapper(p_seeded_engine) as session:
@@ -684,7 +924,9 @@ def test_backtest_read_still_exposes_the_parameters_flat(override_session, p_see
         "orgUnits",
         "splitPeriods",
         "maxHorizonDistance",
+        "chapVersion",
         "dataset",
+        "specificationId",
         "aggregateMetrics",
         "configuredModel",
         "predictionSetupId",
@@ -900,6 +1142,33 @@ def test_get_prediction_setup_includes_linked_predictions(override_session, seed
     body = response.json()
     assert len(body["predictions"]) == 1
     assert body["predictions"][0]["id"] == prediction.id
+    assert body["predictions"][0]["predictionSetupId"] == setup_id
+
+
+@pytest.mark.parametrize("list_predictions", [False, True])
+def test_prediction_response_exposes_setup_id(override_session, seeded_session, list_predictions):
+    prediction = seeded_session.exec(select(Prediction)).first()
+    assert prediction is not None
+    endpoint = "/v1/crud/predictions" if list_predictions else f"/v1/crud/predictions/{prediction.id}"
+
+    def read_prediction():
+        response = client.get(endpoint)
+        assert response.status_code == 200, response.json()
+        body = response.json()
+        return next(item for item in body if item["id"] == prediction.id) if list_predictions else body
+
+    assert read_prediction()["predictionSetupId"] is None
+
+    backtest = seeded_session.exec(select(Backtest)).first()
+    assert backtest is not None
+    created = _create_prediction_setup(backtest.id)
+    assert created.status_code == 200, created.json()
+    setup_id = created.json()["id"]
+    prediction.prediction_setup_id = setup_id
+    seeded_session.add(prediction)
+    seeded_session.commit()
+
+    assert read_prediction()["predictionSetupId"] == setup_id
 
 
 def test_get_prediction_setup_not_found_returns_404(clean_engine, dependency_overrides):
@@ -988,7 +1257,7 @@ class _NoopRedis:
     def hgetall(self, _key):
         return {}
 
-    def delete(self, _key):
+    def delete(self, *_keys):
         return 0
 
 
@@ -1069,9 +1338,10 @@ def test_delete_prediction_setup_sweeps_matching_job_meta_in_redis(override_sess
         def hgetall(self, key):
             return self.meta[key]
 
-        def delete(self, key):
-            self.deleted.append(key)
-            self.meta.pop(key, None)
+        def delete(self, *keys):
+            self.deleted.extend(keys)
+            for key in keys:
+                self.meta.pop(key, None)
             return 1
 
     fake_redis = _FakeRedis()
@@ -1082,7 +1352,7 @@ def test_delete_prediction_setup_sweeps_matching_job_meta_in_redis(override_sess
     response = client.delete(f"/v1/crud/prediction-setups/{setup_id}")
     assert response.status_code == 200, response.json()
 
-    assert fake_redis.deleted == ["job_meta:job-1"]
+    assert fake_redis.deleted == ["job_meta:job-1", "job_request:job-1"]
     assert "job_meta:job-2" in fake_redis.meta
 
 
@@ -1192,6 +1462,60 @@ def test_run_prediction_setup_inherits_the_backtest_provider(
 
     assert response.status_code == 200, response.json()
     assert captured["prediction_params"].future_weather_provider == "damped_persistence"
+
+
+def test_run_prediction_setup_forecasts_the_backtest_target(
+    override_session, seeded_session, p_seeded_engine, example_polygons, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from chap_core.rest_api.celery_tasks import JOB_NAME_KW, JOB_REQUEST_KW, JOB_TYPE_KW
+    from chap_core.rest_api.v1.routers import crud
+
+    backtest = seeded_session.exec(select(Backtest)).first()
+    backtest.model_db_id = seeded_session.exec(
+        select(ConfiguredModelDB.id).where(ConfiguredModelDB.name == "naive_model")
+    ).one()
+    backtest.specification = BacktestSpecification(
+        **backtest.specification.model_dump(exclude={"id"}) | {"target_column": "hospitalisations"}
+    )
+    seeded_session.commit()
+    setup_id = _create_prediction_setup(backtest.id, "Target forecast").json()["id"]
+
+    request = create_make_data_request(example_polygons, [], ["rainfall", "hospitalisations", "disease_cases"])
+    for observation in request.provided_data:
+        observation.value = 0.0 if observation.feature_name == "hospitalisations" else 1000.0
+        if observation.feature_name != "rainfall" and observation.period == "2020-01":
+            observation.value = None  # Target gaps must not reject otherwise valid locations.
+    payload = request.model_dump(mode="json", exclude={"data_to_be_fetched", "data_sources"})
+    payload["nPeriods"] = 3
+
+    def run_inline(func, *args, **kwargs):
+        for key in ("database_url", JOB_TYPE_KW, JOB_NAME_KW, JOB_REQUEST_KW):
+            kwargs.pop(key)
+        kwargs["prediction_params"] = kwargs["prediction_params"].model_dump()
+        with SessionWrapper(p_seeded_engine) as session:
+            prediction_id = func(*args, session=session, **kwargs)
+        return SimpleNamespace(id=str(prediction_id))
+
+    monkeypatch.setattr(crud.worker, "queue_db", run_inline)
+    response = client.post(f"/v1/crud/prediction-setups/{setup_id}/run", json=payload)
+    assert response.status_code == 200, response.text
+
+    prediction = seeded_session.get(Prediction, int(response.json()["id"]))
+    assert len(prediction.forecasts) == 3 * len(example_polygons.features)
+    # Training on hospitalisations (all zero) rather than disease_cases gives all-zero samples.
+    assert all(forecast.values and set(forecast.values) == {0.0} for forecast in prediction.forecasts)
+
+
+def test_run_prediction_setup_rejects_missing_target(override_session, seeded_session, example_polygons):
+    backtest = seeded_session.exec(select(Backtest)).first()
+    setup_id = _create_prediction_setup(backtest.id, "Missing target").json()["id"]
+    request = create_make_data_request(example_polygons, [], ["rainfall"])
+    payload = request.model_dump(mode="json", exclude={"data_to_be_fetched", "data_sources"})
+
+    response = client.post(f"/v1/crud/prediction-setups/{setup_id}/run", json=payload)
+    assert response.status_code == 422, response.text
 
 
 def test_run_prediction_setup_rejects_a_look_ahead_provider(override_session, seeded_session, example_polygons):
@@ -1425,6 +1749,7 @@ def test_run_prediction_setup_normalizes_dataset_type_to_prediction(
 
     dataset_info = captured["kwargs"]["dataset_create_info"]
     assert dataset_info["type"] == "prediction"
+    assert captured["kwargs"]["prediction_setup_id"] == setup_id
 
 
 @pytest.mark.skip(
@@ -1522,12 +1847,16 @@ def _check_rejected_org_units(content, expected_rejections):
         assert rejected_regions == set(expected_rejections), (rejected_regions, expected_rejections)
 
 
-@pytest.mark.skip(reason="Failing because of missing geojson file")
-def test_add_csv_dataset(celery_session_worker, dependency_overrides, data_path):
-    csv_data = open(data_path / "nicaragua_weekly_data.csv", "rb")
-    geojson_data = open(data_path / "nicaragua.json", "rb")
-    response = client.post("/v1/crud/datasets/csvFile", files={"csvFile": csv_data, "geojsonFile": geojson_data})
+def test_add_csv_dataset(dependency_overrides, data_path):
+    with (
+        open(data_path / "vietnam_monthly.csv", "rb") as csv_data,
+        open(data_path / "vietnam_monthly.geojson", "rb") as geojson_data,
+    ):
+        response = client.post("/v1/crud/datasets/csvFile", files={"csv_file": csv_data, "geojson_file": geojson_data})
     assert response.status_code == 200, response.json()
+    response = client.get(f"/v1/crud/datasets/{response.json()['id']}")
+    assert response.status_code == 200, response.json()
+    assert DataSetWithObservations.model_validate(response.json()).created_manually
 
 
 def test_full_prediction_flow(celery_session_worker, dependency_overrides, example_polygons):
@@ -1590,8 +1919,8 @@ def test_backtest_with_empty_provided_data_dry_run(dependency_overrides, create_
     assert body["rejected"] == []
 
 
-def test_backtest_with_all_regions_rejected_dry_run(dependency_overrides, create_backtest_with_data_request):
-    request_payload = create_backtest_with_data_request.model_dump()
+def _drop_one_covariate_period_per_location(request_payload) -> str:
+    """Remove the first observation of a covariate for every location, so validation rejects them all."""
     obs = request_payload["provided_data"]
     target_feature = next(e["feature_name"] for e in obs if e["feature_name"] != "disease_cases")
     seen_locations = set()
@@ -1602,14 +1931,50 @@ def test_backtest_with_all_regions_rejected_dry_run(dependency_overrides, create
             continue
         pruned.append(entry)
     request_payload["provided_data"] = pruned
+    return target_feature
 
-    response = client.post("/v1/analytics/create-backtest-with-data?dryRun=true", json=request_payload)
+
+def _check_all_regions_rejected_dry_run(url, request_payload):
+    target_feature = _drop_one_covariate_period_per_location(request_payload)
+    response = client.post(f"{url}?dryRun=true", json=request_payload)
     assert response.status_code == 200, response.json()
     body = response.json()
     assert body["id"] is None
     assert body["importedCount"] == 0
     assert len(body["rejected"]) > 0
     assert all(r["featureName"] == target_feature for r in body["rejected"])
+
+
+def test_backtest_with_all_regions_rejected_dry_run(dependency_overrides, create_backtest_with_data_request):
+    _check_all_regions_rejected_dry_run(
+        "/v1/analytics/create-backtest-with-data", create_backtest_with_data_request.model_dump()
+    )
+
+
+def test_make_dataset_dry_run(dependency_overrides, dataset_make_request, org_units):
+    response = client.post("/v1/analytics/make-dataset?dryRun=true", json=dataset_make_request.model_dump())
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["id"] is None
+    assert body["importedCount"] == len(org_units)
+    assert body["rejected"] == []
+
+
+def test_make_dataset_all_regions_rejected_dry_run(dependency_overrides, dataset_make_request):
+    _check_all_regions_rejected_dry_run("/v1/analytics/make-dataset", dataset_make_request.model_dump())
+
+
+def test_make_dataset_all_polygons_missing_returns_500_with_rejections(
+    dependency_overrides, dataset_make_request, org_units
+):
+    request_payload = dataset_make_request.model_dump()
+    request_payload["geojson"]["features"] = []
+    response = client.post("/v1/analytics/make-dataset", json=request_payload)
+    assert response.status_code == 500, response.json()
+    detail = response.json()["detail"]
+    assert detail["message"] == "Missing values. No data was imported."
+    assert {r["orgUnit"] for r in detail["rejected"]} == set(org_units)
+    assert all(r["featureName"] == "polygon" for r in detail["rejected"])
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
@@ -1655,6 +2020,7 @@ def _check_backtest_with_data(request_payload, expected_rejections=None, dry_run
     response = client.get(f"/v1/crud/backtests/{db_id}/info")
     assert response.status_code == 200, response.json()
     backtest_info = BacktestRead.model_validate(response.json())
+    assert backtest_info.stride == request_payload["stride"]
     assert len(backtest_info.dataset.data_sources) > 0, backtest_info.dataset
     assert len(backtest_info.dataset.org_units) > 0, backtest_info.dataset
     assert backtest_info.dataset.last_period is not None, backtest_info.dataset
@@ -1806,3 +2172,264 @@ def test_get_dataset_df_with_nans(override_session, seeded_session):
     assert any(record.get("disease_cases") is None for record in records), (
         "Expected at least one None disease_cases value in the response"
     )
+
+
+# alert policies
+
+
+def _alert_policy_payload(name: str = "Dengue ladder") -> dict:
+    return {
+        "name": name,
+        "levels": [
+            {
+                "name": "monitor",
+                "thresholdParams": {"type": "seasonal", "stdMultiplier": 1.0},
+                "exceedanceThreshold": 0.3,
+            },
+            {
+                "name": "action",
+                "thresholdParams": {"type": "percentile", "quantile": 0.9},
+                "exceedanceThreshold": 0.8,
+            },
+        ],
+    }
+
+
+def _create_alert_policy(name: str = "Dengue ladder"):
+    return client.post("/v1/crud/alert-policies", json=_alert_policy_payload(name))
+
+
+def test_create_alert_policy_happy_path(clean_engine, dependency_overrides):
+    """A policy round-trips its tiers, each keeping its own strategy's params."""
+    response = _create_alert_policy("Ladder A")
+    assert response.status_code == 200, response.json()
+    policy_id = response.json()["id"]
+
+    body = client.get(f"/v1/crud/alert-policies/{policy_id}").json()
+    assert body["name"] == "Ladder A"
+    assert [level["name"] for level in body["levels"]] == ["monitor", "action"]
+    assert body["levels"][0]["thresholdParams"] == {"type": "seasonal", "stdMultiplier": 1.0}
+    assert body["levels"][1]["thresholdParams"]["quantile"] == 0.9
+    assert body["levels"][1]["exceedanceThreshold"] == 0.8
+
+
+def test_list_alert_policies_includes_every_created_policy(clean_engine, dependency_overrides):
+    # clean_engine is session-scoped, so assert on a subset rather than on an empty list.
+    first = _create_alert_policy("Listed one").json()["id"]
+    second = _create_alert_policy("Listed two").json()["id"]
+
+    response = client.get("/v1/crud/alert-policies")
+    assert response.status_code == 200
+    listed = {policy["id"]: policy["name"] for policy in response.json()}
+    assert listed[first] == "Listed one"
+    assert listed[second] == "Listed two"
+
+
+def test_get_unknown_alert_policy_returns_404(clean_engine, dependency_overrides):
+    assert client.get("/v1/crud/alert-policies/99999").status_code == 404
+
+
+def test_create_alert_policy_without_levels_returns_422(clean_engine, dependency_overrides):
+    response = client.post("/v1/crud/alert-policies", json={"name": "empty", "levels": []})
+    assert response.status_code == 422, response.text
+
+
+def test_create_alert_policy_with_an_unknown_strategy_returns_422(clean_engine, dependency_overrides):
+    """The params discriminator only admits registered strategies."""
+    response = client.post(
+        "/v1/crud/alert-policies",
+        json={
+            "name": "bogus",
+            "levels": [{"name": "alert", "thresholdParams": {"type": "not-a-strategy"}, "exceedanceThreshold": 0.5}],
+        },
+    )
+    assert response.status_code == 422, response.text
+
+
+def test_create_alert_policy_with_out_of_range_exceedance_returns_422(clean_engine, dependency_overrides):
+    response = client.post(
+        "/v1/crud/alert-policies",
+        json={
+            "name": "bad cut",
+            "levels": [
+                {
+                    "name": "alert",
+                    "thresholdParams": {"type": "seasonal"},
+                    "exceedanceThreshold": 1.5,
+                }
+            ],
+        },
+    )
+    assert response.status_code == 422, response.text
+
+
+def test_delete_unused_alert_policy(clean_engine, dependency_overrides):
+    policy_id = _create_alert_policy("Ladder D").json()["id"]
+    assert client.delete(f"/v1/crud/alert-policies/{policy_id}").status_code == 200
+    assert client.get(f"/v1/crud/alert-policies/{policy_id}").status_code == 404
+
+
+def test_prediction_setup_carries_its_alert_policy(override_session, seeded_session):
+    """A setup created against a policy reports it back on read."""
+    backtest = seeded_session.exec(select(Backtest)).first()
+    assert backtest is not None
+    policy_id = _create_alert_policy("Ladder E").json()["id"]
+
+    payload = _prediction_setup_payload(backtest.id, "Setup with alerts") | {"alertPolicyId": policy_id}
+    response = client.post("/v1/crud/prediction-setups", json=payload)
+    assert response.status_code == 200, response.json()
+
+    body = client.get(f"/v1/crud/prediction-setups/{response.json()['id']}").json()
+    assert body["alertPolicy"]["id"] == policy_id
+    assert [level["name"] for level in body["alertPolicy"]["levels"]] == ["monitor", "action"]
+
+
+def test_prediction_setup_without_a_policy_reports_none(override_session, seeded_session):
+    backtest = seeded_session.exec(select(Backtest)).first()
+    assert backtest is not None
+    setup_id = _create_prediction_setup(backtest.id, "No alerts").json()["id"]
+    assert client.get(f"/v1/crud/prediction-setups/{setup_id}").json()["alertPolicy"] is None
+
+
+def test_prediction_setup_with_unknown_alert_policy_returns_404(override_session, seeded_session):
+    backtest = seeded_session.exec(select(Backtest)).first()
+    assert backtest is not None
+    payload = _prediction_setup_payload(backtest.id, "ghost policy") | {"alertPolicyId": 99999}
+    assert client.post("/v1/crud/prediction-setups", json=payload).status_code == 404
+
+
+def test_attaching_an_alert_policy_by_patch(override_session, seeded_session):
+    backtest = seeded_session.exec(select(Backtest)).first()
+    assert backtest is not None
+    setup_id = _create_prediction_setup(backtest.id, "Later alerts").json()["id"]
+    policy_id = _create_alert_policy("Ladder F").json()["id"]
+
+    response = client.patch(f"/v1/crud/prediction-setups/{setup_id}", json={"alertPolicyId": policy_id})
+    assert response.status_code == 200, response.json()
+    assert response.json()["alertPolicy"]["id"] == policy_id
+
+
+# alerts
+
+
+def _alert_payload(policy_id: int, org_unit: str = "A", period: str = "2024-07", level: str = "action") -> dict:
+    return {"timePeriod": period, "orgUnit": org_unit, "alertPolicyId": policy_id, "level": level}
+
+
+def _create_alerts(policy_id: int, **kwargs):
+    return client.post("/v1/crud/alerts", json={"alerts": [_alert_payload(policy_id, **kwargs)]})
+
+
+def test_create_alert_starts_pending(clean_engine, dependency_overrides):
+    """An alert is recorded unreleased; a human has to clear it."""
+    policy_id = _create_alert_policy("Alerts A").json()["id"]
+    response = _create_alerts(policy_id)
+    assert response.status_code == 200, response.text
+    (alert_id,) = response.json()["ids"]
+
+    body = client.get(f"/v1/crud/alerts/{alert_id}").json()
+    assert body["approved"] == "pending"
+    assert body["approvedBy"] is None
+    assert body["level"] == "action"
+    assert body["alertPolicyId"] == policy_id
+
+
+def test_create_alert_with_a_level_the_policy_lacks_returns_422(clean_engine, dependency_overrides):
+    policy_id = _create_alert_policy("Alerts B").json()["id"]
+    response = _create_alerts(policy_id, level="catastrophe")
+    assert response.status_code == 422, response.text
+
+
+def test_get_unknown_alert_returns_404(clean_engine, dependency_overrides):
+    assert client.get("/v1/crud/alerts/99999").status_code == 404
+
+
+def test_approving_a_set_of_alerts(clean_engine, dependency_overrides):
+    policy_id = _create_alert_policy("Alerts C").json()["id"]
+    created = client.post(
+        "/v1/crud/alerts",
+        json={"alerts": [_alert_payload(policy_id, org_unit="A"), _alert_payload(policy_id, org_unit="B")]},
+    ).json()["ids"]
+
+    response = client.post(
+        "/v1/crud/alerts/$approve",
+        json={"alertIds": created, "approved": "approved", "approvedBy": "knut"},
+    )
+    assert response.status_code == 200, response.text
+    assert {alert["approved"] for alert in response.json()} == {"approved"}
+    assert {alert["approvedBy"] for alert in response.json()} == {"knut"}
+
+
+def test_approving_with_an_unknown_id_returns_404(clean_engine, dependency_overrides):
+    policy_id = _create_alert_policy("Alerts E").json()["id"]
+    (alert_id,) = _create_alerts(policy_id).json()["ids"]
+
+    response = client.post(
+        "/v1/crud/alerts/$approve",
+        json={"alertIds": [alert_id, 99999], "approved": "approved", "approvedBy": "knut"},
+    )
+    assert response.status_code == 404, response.text
+
+
+def test_listing_alerts_filters_by_policy(clean_engine, dependency_overrides):
+    first_policy = _create_alert_policy("Alerts F").json()["id"]
+    second_policy = _create_alert_policy("Alerts G").json()["id"]
+    (expected,) = _create_alerts(first_policy).json()["ids"]
+    _create_alerts(second_policy)
+
+    listed = client.get("/v1/crud/alerts", params={"alertPolicyId": first_policy}).json()
+    assert [alert["id"] for alert in listed] == [expected]
+
+
+def test_deleting_a_policy_with_alerts_returns_409(clean_engine, dependency_overrides):
+    """An alert's level name only means something against its policy."""
+    policy_id = _create_alert_policy("Alerts H").json()["id"]
+    _create_alerts(policy_id)
+    assert client.delete(f"/v1/crud/alert-policies/{policy_id}").status_code == 409
+
+
+def test_deleting_a_prediction_with_alerts_returns_409(override_session, seeded_session):
+    """An alert only means something alongside the forecast that justified it."""
+    prediction = seeded_session.exec(select(Prediction)).first()
+    assert prediction is not None
+    policy_id = _create_alert_policy("Alerts I").json()["id"]
+    payload = _alert_payload(policy_id) | {"predictionId": prediction.id}
+    assert client.post("/v1/crud/alerts", json={"alerts": [payload]}).status_code == 200
+
+    response = client.delete(f"/v1/crud/predictions/{prediction.id}")
+    assert response.status_code == 409, response.text
+    assert "alert" in response.json()["detail"].lower()
+
+
+def test_deleting_an_alert_lets_its_policy_be_deleted(clean_engine, dependency_overrides):
+    policy_id = _create_alert_policy("Alerts K").json()["id"]
+    (alert_id,) = _create_alerts(policy_id).json()["ids"]
+
+    assert client.delete(f"/v1/crud/alerts/{alert_id}").status_code == 200
+    assert client.get(f"/v1/crud/alerts/{alert_id}").status_code == 404
+    assert client.delete(f"/v1/crud/alert-policies/{policy_id}").status_code == 200
+
+
+def test_deleting_an_approved_alert_returns_409(clean_engine, dependency_overrides):
+    policy_id = _create_alert_policy("Alerts L").json()["id"]
+    (alert_id,) = _create_alerts(policy_id).json()["ids"]
+    client.post("/v1/crud/alerts/$approve", json={"alertIds": [alert_id], "approved": "approved", "approvedBy": "knut"})
+
+    assert client.delete(f"/v1/crud/alerts/{alert_id}").status_code == 409
+
+
+def test_deleting_an_unknown_alert_returns_404(clean_engine, dependency_overrides):
+    assert client.delete("/v1/crud/alerts/99999").status_code == 404
+
+
+def test_deleting_a_prediction_without_alerts_still_works(override_session, seeded_session):
+    prediction = seeded_session.exec(select(Prediction)).first()
+    assert prediction is not None
+    assert client.delete(f"/v1/crud/predictions/{prediction.id}").status_code == 200
+
+
+def test_there_is_no_patch_endpoint_for_alert_policies(clean_engine, dependency_overrides):
+    """Levels are immutable: editing them would orphan the alerts naming them."""
+    policy_id = _create_alert_policy("Alerts J").json()["id"]
+    response = client.patch(f"/v1/crud/alert-policies/{policy_id}", json={"name": "renamed"})
+    assert response.status_code == 405, response.text

@@ -1,14 +1,46 @@
 """Unit tests for chap_core.util helpers."""
 
 import re
+import socket
+import time
 
-from chap_core.util import REDIS_CONNECT_TIMEOUT_SECONDS, generate_run_name, generate_short_id, load_redis
+import redis
+
+from chap_core.util import (
+    REDIS_CONNECT_TIMEOUT_SECONDS,
+    generate_run_name,
+    generate_short_id,
+    load_redis,
+    redis_available,
+)
 
 
 def test_load_redis_bounds_the_connect():
     """An unreachable host that drops packets must not block the caller forever."""
     kwargs = load_redis().connection_pool.connection_kwargs
     assert kwargs["socket_connect_timeout"] == REDIS_CONNECT_TIMEOUT_SECONDS
+
+
+def test_redis_available_is_false_when_the_connect_times_out(monkeypatch):
+    """An unreachable host that drops packets means no redis, not an error."""
+
+    def ping(self):
+        raise redis.exceptions.TimeoutError("Timeout connecting to server")
+
+    monkeypatch.setattr(redis.Redis, "ping", ping)
+    assert redis_available() is False
+
+
+def test_redis_available_does_not_retry_a_refused_connection(monkeypatch):
+    """Without a running redis the probe should fail at once, not retry with backoff."""
+    with socket.socket() as unused:
+        unused.bind(("127.0.0.1", 0))
+        port = unused.getsockname()[1]
+    monkeypatch.setenv("REDIS_HOST", "127.0.0.1")
+    monkeypatch.setenv("REDIS_PORT", str(port))
+    start = time.monotonic()
+    assert redis_available() is False
+    assert time.monotonic() - start < 1.0
 
 
 def test_generate_short_id_default_is_8_hex_chars():

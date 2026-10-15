@@ -23,7 +23,9 @@ from chap_core.assessment.metrics.base import (
     MetricSpec,
     OptimizationDirection,
     ProbabilisticMetric,
+    TargetBehavior,
 )
+from chap_core.assessment.metrics.comparison import comparison_op, get_comparison_op, list_comparison_ops
 from chap_core.database.tables import Backtest
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,8 @@ def metric():
             raise TypeError(f"{cls} must be a class inheriting from Metric")
         if not hasattr(cls, "spec"):
             raise ValueError(f"{cls.__name__} missing 'spec' class attribute")
+        if cls.spec.comparison_op is not None:
+            get_comparison_op(cls.spec.comparison_op)
 
         _metrics_registry[cls.spec.metric_id] = cls
         return cls
@@ -58,7 +62,7 @@ def get_metric(metric_id: str) -> type[Metric] | None:
 
 
 def list_metrics() -> list[dict]:
-    """List all registered metrics with metadata (id, name, description, aggregation_op)."""
+    """List all registered metrics with scoring and presentation metadata."""
     result = []
     for metric_cls in _metrics_registry.values():
         spec = metric_cls.spec
@@ -67,7 +71,11 @@ def list_metrics() -> list[dict]:
                 "id": spec.metric_id,
                 "name": spec.metric_name,
                 "description": spec.description,
+                "unit": spec.unit,
+                "target": spec.target,
+                "target_behavior": spec.target_behavior.value,
                 "aggregation_op": spec.aggregation_op.value,
+                "comparison_op": spec.comparison_op,
                 "optimization_direction": (
                     spec.optimization_direction.value if spec.optimization_direction is not None else None
                 ),
@@ -106,7 +114,6 @@ from chap_core.assessment.metrics.outbreak_detection import (
     SensitivityMetric,
     SpecificityMetric,
 )
-from chap_core.assessment.metrics.peak_diff import PeakPeriodLagMetric, PeakValueDiffMetric
 from chap_core.assessment.metrics.percentile_coverage import (
     Coverage10_90Metric,
     Coverage25_75Metric,
@@ -140,8 +147,6 @@ __all__ = [
     "Metric",
     "MetricSpec",
     "OutbreakAccuracyMetric",
-    "PeakPeriodLagMetric",
-    "PeakValueDiffMetric",
     "PercentileCoverageMetric",
     "ProbabilisticMetric",
     "RMSEMetric",
@@ -155,8 +160,11 @@ __all__ = [
     "WinklerScoreLog1pMetric",
     "WinklerScoreMetric",
     "available_metrics",
+    "comparison_op",
+    "get_comparison_op",
     "get_metric",
     "get_metrics_registry",
+    "list_comparison_ops",
     "list_metrics",
     "metric",
 ]
@@ -282,11 +290,11 @@ def get_optimization_direction(metric_id: str) -> OptimizationDirection:
     if metric_cls is None:
         raise ValueError(f"Unknown metric {metric_id!r}")
 
-    direction = metric_cls.spec.optimization_direction
-    if direction is None:
+    spec = metric_cls.spec
+    if spec.optimization_direction is None or not spec.proper_scoring_rule:
         raise ValueError(
             f"Metric {metric_id!r} is not defined as a direct HPO objective. "
-            "Choose a metric with an explicit optimization direction."
+            "Choose a proper scoring rule with an explicit optimization direction."
         )
 
-    return direction
+    return spec.optimization_direction

@@ -92,6 +92,7 @@ def _create_evaluation(
         ModelConfiguration,
         ModelTemplateDB,
     )
+    from chap_core.external.ExtendedPredictor import ExtendedPredictor
     from chap_core.models.model_template import ModelTemplate
     from chap_core.models.utils import CHAP_RUNS_DIR
 
@@ -108,8 +109,8 @@ def _create_evaluation(
     if model_candidate.configuration:
         configuration = ModelConfiguration.model_validate(model_candidate.configuration)
 
-    model = template.get_model(configuration)  # type: ignore[arg-type]
-    estimator = model()
+    model = template.get_model(configuration, prediction_length=backtest_params.n_periods)  # type: ignore[arg-type]
+    estimator = ExtendedPredictor.extend_to_horizon(model(), backtest_params.n_periods)
 
     model_template_db = ModelTemplateDB(
         id=template.model_template_config.name,
@@ -167,7 +168,7 @@ def preference_learn(
     """
     import yaml
 
-    from chap_core.hpo.base import load_search_space_from_config
+    from chap_core.hpo.search_space import search_space_from_config
     from chap_core.log_config import initialize_logging
     from chap_core.models.model_template import ModelTemplate
     from chap_core.models.utils import CHAP_RUNS_DIR
@@ -211,7 +212,7 @@ def preference_learn(
             with open(search_space_yaml) as f:
                 raw_search_space = yaml.safe_load(f)
 
-        search_space = load_search_space_from_config(raw_search_space)
+        search_space = search_space_from_config(raw_search_space)
 
         logger.info(f"Initializing learner with search space: {search_space}")
         learner = TournamentPreferenceLearner.init(

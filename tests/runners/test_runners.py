@@ -1,3 +1,5 @@
+import logging
+import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock, ANY
 
@@ -21,12 +23,6 @@ import pytest
 from chap_core.util import docker_available
 
 
-def test_command_line_runner():
-    command = "echo 'test'"
-    runner = CommandLineRunner(Path("."))
-    runner.run_command("")
-
-
 @pytest.mark.skipif(not docker_available(), reason="Docker not available")
 def test_docker_runner():
     docker_image = "ubuntu:noble"
@@ -44,6 +40,40 @@ def test_run_command():
     command = "echo 'test2' >&2"
     output = CommandLineRunner("./").run_command(command)
     assert "test2" in output, "Output from command not as expected, output is: " + output
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses POSIX shell syntax")
+def test_run_command_streams_output_to_debug_log(caplog):
+    """Output is logged as it arrives, not only returned at the end."""
+    with caplog.at_level(logging.DEBUG, logger="chap_core.runners.command_line_runner"):
+        CommandLineRunner("./").run_command("echo 'first'; echo 'second' >&2; echo 'third'")
+
+    streamed = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[model] ")]
+    assert streamed == ["[model] first", "[model] second", "[model] third"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses POSIX shell syntax")
+def test_run_command_unbuffers_subprocess_python():
+    """PYTHONUNBUFFERED reaches the subprocess, so its output is not held back."""
+    output = CommandLineRunner("./").run_command('echo "$PYTHONUNBUFFERED"')
+    assert output.strip() == "1"
+
+
+def test_run_command_decodes_output_as_utf8():
+    """Model output is decoded as UTF-8 whatever the locale encoding is."""
+    command = f'"{sys.executable}" -c "import sys; sys.stdout.buffer.write(\'\\u00e6\\u00f8\\u00e5\'.encode())"'
+    assert CommandLineRunner("./").run_command(command) == "\u00e6\u00f8\u00e5"
+
+
+def test_run_command_logs_a_progress_bar_as_one_line(caplog):
+    """A progress bar redrawn with carriage returns is one log line showing its final state."""
+    command = f"\"{sys.executable}\" -c \"print('\\rstep 1\\rstep 2'); print('done')\""
+    with caplog.at_level(logging.DEBUG, logger="chap_core.runners.command_line_runner"):
+        output = CommandLineRunner("./").run_command(command)
+
+    streamed = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[model] ")]
+    assert streamed == ["[model] step 2", "[model] done"]
+    assert "\rstep 1\rstep 2" in output
 
 
 def test_run_command_failure_reports_output_as_text():
@@ -420,3 +450,29 @@ def test_runner_selection_with_conda_env(tmp_path):
     )
     runner = get_train_predict_runner_from_model_template_config(config, tmp_path)
     assert isinstance(runner, CondaTrainPredictRunner)
+
+
+def test_command_line_runner_simulate_formats_command():
+    with patch.object(CommandLineRunner, "run_command") as mock_run:
+        from chap_core.runners.command_line_runner import CommandLineTrainPredictRunner
+
+        runner = CommandLineTrainPredictRunner(
+            CommandLineRunner(Path(".")),
+            train_command="python train.py {train_data} {model}",
+            predict_command="python predict.py {model} {historic_data} {future_data} {out_file}",
+            simulate_command="python simulate.py {covariates} {out_file}",
+        )
+        runner.simulate("covariates.csv", "simulated.csv")
+        mock_run.assert_called_once_with("python simulate.py covariates.csv simulated.csv")
+
+
+def test_command_line_runner_simulate_raises_when_no_command():
+    from chap_core.runners.command_line_runner import CommandLineTrainPredictRunner
+
+    runner = CommandLineTrainPredictRunner(
+        CommandLineRunner(Path(".")),
+        train_command="python train.py {train_data} {model}",
+        predict_command="python predict.py {model} {historic_data} {future_data} {out_file}",
+    )
+    with pytest.raises(NotImplementedError):
+        runner.simulate("covariates.csv", "simulated.csv")

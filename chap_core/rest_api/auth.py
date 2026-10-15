@@ -5,8 +5,9 @@ unset. ``CHAP_API_TOKEN`` gates the whole API, and ``SERVICEKIT_REGISTRATION_KEY
 chapkit service registration. When both are configured, the registration endpoints
 require both.
 
-The API token is normally presented as ``Authorization: Bearer <token>``, but it is also
-accepted in ``X-Service-Key`` because servicekit can only send that header. On the service
+The API token is presented as ``Authorization: Bearer <token>`` or
+``Authorization: ApiToken <token>`` (DHIS2 route authentication). It is also accepted in
+``X-Service-Key`` because servicekit can only send that header. On the service
 registry paths the registration key is accepted there as well, so a chapkit service holding
 either secret can register without needing to send an ``Authorization`` header.
 """
@@ -31,6 +32,11 @@ MIN_TOKEN_LENGTH = 32
 # /health is called without headers by the container HEALTHCHECK and the Helm probes, and
 # /system/info is how clients discover that a token is required.
 OPEN_PATHS = frozenset({"/health", "/health/ready", "/system/info"})
+
+# FastAPI's own API reference, at its default URLs. It describes an open-source API, so it is
+# public; the spec declares the bearer scheme (see app.py), which gives /docs its Authorize
+# button for calling the gated endpoints.
+API_REFERENCE_PATHS = frozenset({"/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"})
 
 # servicekit can only send X-Service-Key, never Authorization, so self-registering chapkit
 # services present their secret there instead. Confined to the service registry so a
@@ -69,21 +75,22 @@ def secret_matches(presented: str | None, expected: str) -> bool:
     return secrets.compare_digest(presented.encode(), expected.encode())
 
 
-def _bearer_matches(header: str | None, expected: str) -> bool:
+def _authorization_matches(header: str | None, expected: str) -> bool:
     if not header:
         return False
     scheme, _, token = header.partition(" ")
-    if scheme.lower() != "bearer":
+    if scheme.lower() not in {"bearer", "apitoken"}:
         return False
     return secret_matches(token, expected)
 
 
 class ApiTokenMiddleware:
-    """Reject requests without a valid bearer token when ``CHAP_API_TOKEN`` is set.
+    """Reject requests without a valid API token when ``CHAP_API_TOKEN`` is set.
 
     Raw ASGI rather than ``BaseHTTPMiddleware`` so the streaming proxy in
-    ``v2/routers/proxy.py`` passes through untouched, and so ``/docs`` and ``/openapi.json``
-    are covered too -- route dependencies never reach those.
+    ``v2/routers/proxy.py`` passes through untouched. A middleware rather than a route
+    dependency so a request is rejected before its body is read, and so a route added later
+    is gated without anyone having to remember to.
     """
 
     def __init__(self, app: ASGIApp):
@@ -95,7 +102,7 @@ class ApiTokenMiddleware:
 
         expected = get_api_token()
         path = self._path(scope)
-        if expected is None or path in OPEN_PATHS:
+        if expected is None or path in OPEN_PATHS or path in API_REFERENCE_PATHS:
             return await self.app(scope, receive, send)
 
         if not self._is_authorized(scope, path, expected):
@@ -110,7 +117,7 @@ class ApiTokenMiddleware:
 
     @classmethod
     def _is_authorized(cls, scope: Scope, path: str, api_token: str) -> bool:
-        if _bearer_matches(cls._header(scope, b"authorization"), api_token):
+        if _authorization_matches(cls._header(scope, b"authorization"), api_token):
             return True
 
         service_key = cls._header(scope, b"x-service-key")

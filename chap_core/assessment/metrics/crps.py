@@ -82,6 +82,8 @@ class CRPSMetric(ProbabilisticMetric):
         aggregation_op=AggregationOp.MEAN,
         description="Continuous Ranked Probability Score - measures calibration and sharpness",
         optimization_direction=OptimizationDirection.MINIMIZE,
+        proper_scoring_rule=True,
+        comparison_op="skill_ratio",
     )
 
     def compute_sample_metric(self, samples: np.ndarray, observed: float) -> float:
@@ -105,6 +107,8 @@ class CRPSLog1pMetric(ProbabilisticMetric):
         aggregation_op=AggregationOp.MEAN,
         description="CRPS computed on log(1+x)-transformed forecasts and observations",
         optimization_direction=OptimizationDirection.MINIMIZE,
+        proper_scoring_rule=True,
+        comparison_op="skill_ratio",
     )
 
     def compute_sample_metric(self, samples: np.ndarray, observed: float) -> float:

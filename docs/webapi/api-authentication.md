@@ -57,18 +57,24 @@ curl -H "Authorization: Bearer your-generated-token" \
   http://localhost:8000/v1/crud/datasets
 ```
 
+Chap Core also accepts `Authorization: ApiToken your-generated-token`, as sent by DHIS2
+routes using `auth.type = api-token`. Both schemes use the same `CHAP_API_TOKEN` value.
+Scheme names are case-insensitive; the token must match exactly.
+
 ## Which endpoints require the token
 
-When `CHAP_API_TOKEN` is set, **every** endpoint requires it except the three below. Note
-that this includes the interactive documentation, so `/docs`, `/redoc` and `/openapi.json`
-are not browsable on a token-protected instance.
+When `CHAP_API_TOKEN` is set, **every** API endpoint requires it except the ones below.
 
 | Path | Auth | Why |
 |------|------|-----|
 | `/health` | Public | Liveness probe. Called without headers by the container healthcheck and Kubernetes. |
 | `/health/ready` | Public | Readiness probe, same reason. |
 | `/system/info` | Public | Lets clients discover whether a token is required before authenticating. |
-| Everything else | Required | Includes `/v1/**`, `/v2/**`, `/docs`, `/redoc` and `/openapi.json`. |
+| `/docs`, `/redoc`, `/openapi.json` | Public | The API reference. It describes an open-source API, so it discloses nothing. |
+| Everything else | Required | Includes `/v1/**` and `/v2/**`. |
+
+To call the API from `/docs`, click **Authorize**, paste the token, and "Try it out" then
+sends it as `Authorization: Bearer <token>`.
 
 Service registration is covered too, with one accommodation for chapkit -- see
 [Relation to the service registration key](#relation-to-the-service-registration-key).
@@ -80,7 +86,7 @@ When `CHAP_API_TOKEN` is configured:
 | Scenario | Response |
 |----------|----------|
 | Missing `Authorization` header | 401 Unauthorized |
-| Wrong token, or a scheme other than `Bearer` | 401 Unauthorized |
+| Wrong token, or a scheme other than `Bearer` or `ApiToken` | 401 Unauthorized |
 
 Both cases return the same body and a `WWW-Authenticate: Bearer` header, so a client can
 tell "this server wants a token" apart from a network failure:
@@ -111,8 +117,21 @@ curl http://localhost:8000/system/info
 
 ## Connecting from the Modeling App
 
-The Modeling App reaches Chap Core through a DHIS2 Route. Configure the route to add the
-`Authorization` header so the token is stored in DHIS2 rather than in the browser. See the
+The Modeling App reaches Chap Core through a DHIS2 Route. Configure the route's encrypted
+authentication with the CHAP token:
+
+```json
+{
+  "auth": {
+    "type": "api-token",
+    "token": "your-generated-token"
+  }
+}
+```
+
+DHIS2 sends `Authorization: ApiToken your-generated-token` to Chap Core. Use the value of
+`CHAP_API_TOKEN`, not a DHIS2 personal access token. Existing routes sending a Bearer token
+continue to work. See the
 [DHIS2 Route API documentation](https://docs.dhis2.org/en/develop/using-the-api/dhis-core-version-242/route.html)
 for the `headers` and `auth` fields.
 
@@ -138,4 +157,4 @@ general-purpose credential against `/v1/**`, so a model service cannot read or d
 datasets with it.
 
 Other clients -- the Modeling App, `curl`, the Python SDK -- should use
-`Authorization: Bearer`.
+`Authorization: Bearer` or `Authorization: ApiToken`.

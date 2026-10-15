@@ -61,7 +61,8 @@ The v1 router (`rest_api/v1/rest_api.py`) includes four sub-routers:
 
 Standard CRUD endpoints for the core domain objects:
 
-- **Backtests** -- list, get, create, update, delete evaluations.
+- **Backtests** -- list (filterable by `specificationId` and `datasetId`), get, create, update, delete evaluations.
+- **Backtest specifications** -- list the evaluation setups backtests ran under, filterable by dataset and every `BacktestParams` field, and get one with every backtest under it (the benchmark leaderboard).
 - **Predictions** -- list, get, delete predictions.
 - **Datasets** -- list, get, create (JSON or CSV), export as CSV/DataFrame, delete.
 - **Model templates** -- list all templates (also triggers chapkit sync).
@@ -76,8 +77,9 @@ executed by the Celery worker.
 
 Higher-level endpoints used by the Modeling App:
 
-- `POST /make-dataset` -- validate, harmonize and import a dataset.
+- `POST /make-dataset` -- validate, harmonize and import a dataset. Supports a `dryRun` query param for validation only.
 - `POST /create-backtest` -- create a backtest from an existing dataset.
+- `POST /create-backtests` -- run several configured models on an existing dataset under one specification; returns the specification id and one job id per model.
 - `POST /create-backtest-with-data/` -- validate data, create dataset, then run backtest. This is the main endpoint used by the Modeling App. Supports a `dryRun` query param for validation only.
 - `POST /make-prediction` -- validate data and run a prediction.
 - `GET /evaluation-entry` -- return quantile-based forecast data for a backtest.
@@ -96,7 +98,7 @@ Monitor and manage async Celery jobs:
 - `GET /v1/jobs/{id}` -- get job status (PENDING, STARTED, SUCCESS, FAILURE, REVOKED).
 - `DELETE /v1/jobs/{id}` -- delete a completed job's metadata.
 - `POST /v1/jobs/{id}/cancel` -- cancel a running job.
-- `GET /v1/jobs/{id}/logs` -- get user-facing status logs for a job.
+- `GET /v1/jobs/{id}/logs` -- get the tail of a job's complete log.
 - `GET /v1/jobs/{id}/database_result` -- get the database ID produced by a completed job.
 - `GET /v1/jobs/{id}/prediction_result` -- get prediction results.
 - `GET /v1/jobs/{id}/evaluation_result` -- get evaluation results.
@@ -117,9 +119,10 @@ The v2 API currently only contains the **service registry** for chapkit model se
 3. The chapkit container sends periodic `PUT /v2/services/{id}/$ping` requests to stay registered.
 4. If pings stop, Redis automatically expires the registration.
 
-The registration endpoint also eagerly syncs the chapkit service into the PostgreSQL
-database (model templates and configured models) so the v1 CRUD endpoints can serve
-them immediately.
+The registration endpoint also eagerly stores the service's model template (from its own
+info and config schema) if no template is stored under its version yet, and reports a
+revision mismatch in its response. Registration creates no configured models: the reviewed
+configurations come from the marketplace entry through `chap-admin install`.
 
 ### Authentication
 
@@ -244,6 +247,7 @@ The `JobType` enum defines the canonical job types:
 - `EVALUATION` ("create_backtest_from_data") -- backtest with inline data
 - `PREDICTION` ("create_prediction") -- prediction
 - `DATASET` ("create_dataset") -- dataset import
+- `BASELINE` ("run_baseline") -- a baseline model run on a backtest specification, queued by CHAP itself
 
 These string values are the contract with the Modeling App frontend.
 
@@ -258,14 +262,24 @@ perform the database operations.
 
 Chapkit is an external model service framework. The integration works as follows:
 
-1. Chapkit containers register via `POST /v2/services/$register`.
-2. The `Orchestrator` stores registrations in Redis with TTL-based expiration.
-3. When `GET /v1/crud/model-templates` is called, `_sync_live_chapkit_services()`
-   queries the orchestrator and upserts model templates/configured models into
-   PostgreSQL.
-4. Stale chapkit templates (whose services are no longer live) are archived.
-5. When running a backtest or prediction with a chapkit model, `SessionWrapper.get_configured_model_with_code()` resolves the live service URL from the
-   orchestrator (Redis) and falls back to the stored URL if unavailable.
+1. `chap-admin install` writes the service into the deployment's Compose overlay and
+   starts it.
+2. Chapkit containers register via `POST /v2/services/$register`.
+3. The `Orchestrator` stores registrations in Redis with TTL-based expiration.
+4. Once the service is registered with the pinned commit, `chap-admin install` stores
+   its template through `POST /v1/crud/model-templates/from-service` (from the service's
+   info and config schema) and adds the marketplace entry's verified configurations
+   through `POST /v1/crud/configured-models`. It also passes the entry's `role`, so a
+   model flagged `role: comparison` in the marketplace is stored as a comparison model.
+5. When `GET /v1/crud/model-templates` is called, `_sync_live_chapkit_services()`
+   queries the orchestrator, stores a template for every registered service that has
+   none under its version yet, and reports each stored template's `health_status`. It
+   creates no configured models, and a new version it discovers is listed once it has one.
+6. `chap-admin uninstall` archives the template and its configured models through
+   `DELETE /v1/crud/model-templates/{id}`; nothing is archived because a service went away.
+7. When running a backtest or prediction with a chapkit model, `SessionWrapper.get_configured_model_with_code()` resolves the live service URL from the
+   orchestrator (Redis) and falls back to the stored `source_url` if the service has not
+   registered.
 
 
 ## camelCase conversion

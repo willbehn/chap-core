@@ -34,6 +34,8 @@ class RatioAboveTruthMetric(ProbabilisticMetric):
         aggregation_op=AggregationOp.MEAN,
         description="Proportion of forecast samples exceeding the observed value (0.5 = unbiased)",
         optimization_direction=None,
+        target=0.5,
+        comparison_op="target_distance",
     )
 
     def compute_sample_metric(self, samples: np.ndarray, observed: float) -> float:

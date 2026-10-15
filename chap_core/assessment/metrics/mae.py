@@ -32,6 +32,8 @@ class MAEMetric(DeterministicMetric):
         aggregation_op=AggregationOp.MEAN,
         description="Mean Absolute Error - measures average absolute prediction error",
         optimization_direction=OptimizationDirection.MINIMIZE,
+        proper_scoring_rule=True,
+        comparison_op="skill_ratio",
     )
 
     def compute_point_metric(self, forecast: float, observed: float) -> float:

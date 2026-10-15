@@ -17,20 +17,23 @@ alias_generator=to_camel and FastAPI's response_model_by_alias defaults to True.
 
 import json
 import logging
-from typing import Annotated, Any
+from typing import Annotated, Any, Final, Literal
 
 import numpy as np
-from fastapi import APIRouter, Depends, File, HTTPException, Path, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Path, Query, UploadFile
+from redis.exceptions import RedisError
+from sqlalchemy import func
 from sqlalchemy.orm import selectinload
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 from starlette.responses import StreamingResponse
 
 import chap_core.rest_api.db_worker_functions as wf
-from chap_core.api_types import FeatureCollectionModel
+from chap_core.api_types import BacktestParams, FeatureCollectionModel
 from chap_core.assessment.evaluation import Evaluation
 from chap_core.assessment.metrics import compute_all_detailed_metrics
 from chap_core.assessment.weather_providers import resolve_weather_provider
 from chap_core.data import DataSet as InMemoryDataSet
+from chap_core.database.alert_tables import Alert, AlertApproval, AlertPolicyRead, AlertRead
 from chap_core.database.database import SessionWrapper
 from chap_core.database.dataset_manager import DataSetManager
 from chap_core.database.dataset_tables import (
@@ -40,18 +43,29 @@ from chap_core.database.dataset_tables import (
     DataSetWithObservations,
 )
 from chap_core.database.model_spec_tables import ModelSpecRead
-from chap_core.database.model_templates_and_config_tables import ConfiguredModelDB, ModelConfiguration, ModelTemplateDB
+from chap_core.database.model_templates_and_config_tables import (
+    ConfiguredModelDB,
+    ModelConfiguration,
+    ModelTemplateDB,
+    ModelTemplateRole,
+    chapkit_revision_conflict,
+)
 from chap_core.database.tables import (
     Backtest,
+    BacktestSpecification,
     Prediction,
     PredictionInfo,
     PredictionSetupRead,
     PredictionSetupReadWithPredictions,
+    is_not_baseline_backtest,
 )
 from chap_core.datatypes import FullData, HealthPopulationData, create_tsdataclass
+from chap_core.exceptions import BaselineTemplateConflict, ModelTemplateRevisionConflict
 from chap_core.geometry import Polygons
+from chap_core.rest_api.baseline_runs import request_baselines_after_response
 from chap_core.rest_api.celery_tasks import (
     JOB_NAME_KW,
+    JOB_REQUEST_KW,
     JOB_TYPE_KW,
     PREDICTION_SETUP_ID_JOB_META_KEY,
     CeleryPool,
@@ -59,17 +73,28 @@ from chap_core.rest_api.celery_tasks import (
 )
 from chap_core.rest_api.celery_tasks import r as redis
 from chap_core.rest_api.experimental import api_experimental
-from chap_core.services import prediction_setup_service
+from chap_core.rest_api.services.orchestrator import Orchestrator, ServiceNotFoundError
+from chap_core.rest_api.services.schemas import MLServiceInfo
+from chap_core.rest_api.v2.dependencies import get_orchestrator, get_registry_reader
+from chap_core.services import alert_policy_service, alert_service, prediction_setup_service
 from chap_core.spatio_temporal_data.converters import observations_to_dataset
 
 from ...data_models import (
+    AlertApprovalRequest,
+    AlertIdsResponse,
+    AlertPolicyCreate,
+    AlertsCreate,
     BacktestRead,
+    BacktestSpecificationFilter,
+    BacktestSpecificationRead,
+    BacktestSpecificationSummary,
     BacktestUpdate,
     ConfiguredModelInfoRead,
     DataBaseResponse,
     DatasetCreate,
     JobResponse,
     ModelConfigurationCreate,
+    ModelTemplateFromService,
     ModelTemplateRead,
     PredictionParams,
     PredictionSetupCreate,
@@ -77,192 +102,176 @@ from ...data_models import (
     RunPredictionSetupRequest,
 )
 from .analytics import validate_full_dataset
-from .dependencies import get_database_url, get_session, get_settings
+from .dependencies import get_database_url, get_job_request, get_session, get_settings
 
 logger = logging.getLogger(__name__)
 
 
-def _sync_live_chapkit_services(session: Session, orchestrator=None) -> set[str]:
-    """Sync live chapkit services from the v2 registry into the DB.
+LIVE: Final = "live"
+REVISION_MISMATCH: Final = "revision_mismatch"
 
-    Queries the Redis-backed Orchestrator for registered services and
-    upserts each as a model template. For new templates (no configured
-    models yet), also fetches configs from the chapkit service and
-    creates configured models. Silently skips if Redis is unavailable.
+
+def _registered_chapkit_revision_conflict(
+    session: Session, info: MLServiceInfo
+) -> ModelTemplateRevisionConflict | None:
+    """The conflict between a registered service and the template stored under its version, if any.
+
+    Computed on every read instead of persisted, because the service can change after a
+    sync and a redeploy of the right image should clear the state without cleanup.
+    """
+    template = session.exec(
+        select(ModelTemplateDB).where(ModelTemplateDB.name == info.id, ModelTemplateDB.version == info.version)
+    ).first()
+    if template is not None:
+        return chapkit_revision_conflict(template, info.git_revision)
+    if info.git_revision is None:
+        # Not stored: a row with no digest could never run, and the label would be burnt
+        # for the build that does report a revision.
+        return ModelTemplateRevisionConflict(
+            info.id,
+            info.version,
+            None,
+            None,
+            "build the image with the GIT_REVISION build arg and register it again. The version "
+            "label is not stored yet, so it can be kept.",
+        )
+    return None
+
+
+def _sync_live_chapkit_services(
+    session: Session, orchestrator=None
+) -> dict[tuple[str, str], ModelTemplateRevisionConflict | None]:
+    """Sync the live chapkit services in the v2 registry into stored model templates.
+
+    A registered service that has no stored template under its version gets one,
+    from its own info and config schema. Registration creates no configured models:
+    the reviewed configurations of a model come from its marketplace entry, through
+    ``chap-admin install``. A template whose service is gone is left as it is;
+    ``chap-admin uninstall`` retires it.
 
     Callers that already hold an orchestrator should pass it in. Building a
     fresh one here reaches around FastAPI's dependency overrides and opens a
     second redis connection, which costs a full connect timeout whenever
     redis is unreachable.
 
-    Returns the set of live service IDs from the registry.
+    Returns the revision conflict per registered (template name, version), or None when
+    the service runs the stored source revision. Silently returns nothing if Redis is
+    unavailable.
     """
     try:
         if orchestrator is None:
-            from chap_core.rest_api.v2.dependencies import get_orchestrator
+            from chap_core.rest_api.v2.dependencies import get_registry_reader
 
-            orchestrator = get_orchestrator()
+            orchestrator = get_registry_reader()
         service_list = orchestrator.get_all()
-    except Exception:
+    except RedisError:
         logger.debug("Could not reach service registry, skipping chapkit sync")
-        return set()
+        return {}
+    except Exception:
+        logger.warning("Could not read service registry, skipping chapkit sync", exc_info=True)
+        return {}
 
-    live_ids = {s.info.id for s in service_list.services}
+    conflicts: dict[tuple[str, str], ModelTemplateRevisionConflict | None] = {}
+    for service in service_list.services:
+        conflict = _registered_chapkit_revision_conflict(session, service.info)
+        conflicts[(service.info.id, service.info.version)] = conflict
+        if conflict is not None:
+            logger.warning(str(conflict))
+            continue
+        stored = _stored_template(session, service.info)
+        if stored is not None:
+            _revive_stale_archived_template(session, stored)
+            continue
+        try:
+            add_model_template_from_registered_service(session, service)
+        except BaselineTemplateConflict as conflict:
+            logger.warning(str(conflict))
+        except Exception:
+            # Roll back so a failed database write does not poison the session for the
+            # remaining services. A template version is write-once, so nothing incomplete
+            # is persisted while the service's config schema is unavailable.
+            session.rollback()
+            logger.warning("Could not fetch config schema from %s, will retry next sync", service.url, exc_info=True)
+    return conflicts
 
-    if service_list.count > 0:
-        from chap_core.models.chapkit_rest_api_wrapper import CHAPKitRestAPIWrapper
-        from chap_core.models.external_chapkit_model import (
-            _parse_user_options_from_config_schema,
-            ml_service_info_to_model_template_config,
+
+def _revive_stale_archived_template(session: Session, template: ModelTemplateDB) -> None:
+    """Show again a template that an earlier CHAP archived because its service had gone away.
+
+    Earlier versions archived a chapkit template whenever its service dropped out of the
+    registry, and left its configured models as they were. Such a row is archived but
+    still has configured models that are not, which retiring a template never leaves
+    behind, so a deliberate retire stays in place.
+    """
+    if not template.archived:
+        return
+    live_configuration = session.exec(
+        select(ConfiguredModelDB.id).where(
+            ConfiguredModelDB.model_template_id == template.id, col(ConfiguredModelDB.archived).is_(False)
         )
-
-        session_wrapper = SessionWrapper(session=session)
-        for service in service_list.services:
-            try:
-                # A template version is write-once, so do not persist incomplete
-                # metadata if its config schema is temporarily unavailable. A later
-                # sync can then create the template with its full user options.
-                try:
-                    client = CHAPKitRestAPIWrapper(service.url, timeout=5)
-                    try:
-                        schema = client.get_config_schema()
-                    finally:
-                        client.close()
-                    user_options = _parse_user_options_from_config_schema(schema)
-                except Exception:
-                    logger.warning(
-                        "Could not fetch config schema from %s, will retry next sync",
-                        service.url,
-                        exc_info=True,
-                    )
-                    continue
-
-                config = ml_service_info_to_model_template_config(service.info, service.url, user_options)
-                template_id = session_wrapper.add_model_template_from_yaml_config(config)
-                # Mark template as chapkit-originated for archival tracking
-                template = session.exec(select(ModelTemplateDB).where(ModelTemplateDB.id == template_id)).one()
-                template.uses_chapkit = True
-                session.commit()
-                _sync_chapkit_configured_models(session_wrapper, template_id, service.url, CHAPKitRestAPIWrapper)
-            except Exception:
-                logger.warning("Failed to sync chapkit service %s", service.id, exc_info=True)
-
-    _archive_stale_chapkit_templates(session, service_list)
-    return live_ids
-
-
-def _archive_stale_chapkit_templates(session: Session, service_list) -> None:
-    """Archive chapkit templates whose services are no longer live."""
-    live_names = {s.info.id for s in service_list.services}
-    chapkit_templates = session.exec(
-        select(ModelTemplateDB).where(
-            ModelTemplateDB.uses_chapkit == True,
-            ModelTemplateDB.archived == False,
-        )
-    ).all()
-    for template in chapkit_templates:
-        if template.name not in live_names:
-            template.archived = True
-            session.add(template)
+    ).first()
+    if live_configuration is None:
+        return
+    template.archived = False
+    session.add(template)
     session.commit()
 
 
-def _resolve_chapkit_default_additional_covariates(client) -> list[str]:
-    """Probe a chapkit service for its BaseConfig `additional_continuous_covariates` default.
-
-    Chapkit's `/api/v1/configs/$schema` endpoint doesn't expose `default_factory`
-    values, so the only way to learn what the service considers a sensible default
-    covariate set is to materialize a config with an empty `data` dict and read
-    the pydantic-populated result back. We then delete the probe config to avoid
-    leaving cruft in the service's DB.
-
-    Returns an empty list on any failure — callers should treat the missing
-    defaults as "no additional covariates".
-    """
-    import time
-
-    probe_name = f"__chap_probe_defaults_{int(time.time() * 1000000)}__"
-    try:
-        probe = client.create_config({"name": probe_name, "data": {}})
-    except Exception:
-        logger.debug("Chapkit default probe POST failed", exc_info=True)
-        return []
-
-    try:
-        data = getattr(probe, "data", None) or {}
-        if hasattr(data, "model_dump"):
-            data = data.model_dump()
-        result = list(data.get("additional_continuous_covariates", []) or [])
-    except Exception:
-        logger.debug("Chapkit default probe response parse failed", exc_info=True)
-        result = []
-
-    client.delete_config(str(probe.id))
-    return result
-
-
-def _sync_chapkit_configured_models(
-    session_wrapper: SessionWrapper,
-    template_id: int,
-    service_url: str,
-    wrapper_cls: type,
-) -> None:
-    """Sync configured models from a chapkit service into the DB.
-
-    Skips if the template already has configured models (only syncs
-    on first discovery). Creates a default configured model if the
-    service has no configs.
-
-    `additional_continuous_covariates` for each configured model is seeded
-    from the chapkit service's `BaseConfig` defaults via a one-time probe
-    against `/api/v1/configs`. This matches the legacy config-file-driven
-    behaviour where the overlay YAML supplied the same field, and it is
-    what the modeling app reads to render the model card's covariate count
-    and the data-mapping dialog slots.
-    """
-    existing = session_wrapper.session.exec(
-        select(ConfiguredModelDB).where(ConfiguredModelDB.model_template_id == template_id)
+def _stored_template(session: Session, info: MLServiceInfo) -> ModelTemplateDB | None:
+    return session.exec(
+        select(ModelTemplateDB).where(ModelTemplateDB.name == info.id, ModelTemplateDB.version == info.version)
     ).first()
-    if existing is not None:
-        return
 
-    client = wrapper_cls(service_url, timeout=5)
+
+def _is_baseline_name(session: Session, name: str) -> bool:
+    return (
+        session.exec(
+            select(ModelTemplateDB.id).where(
+                ModelTemplateDB.name == name, ModelTemplateDB.role == ModelTemplateRole.baseline
+            )
+        ).first()
+        is not None
+    )
+
+
+def _fetch_user_options(service_url: str) -> dict:
+    from chap_core.models.chapkit_rest_api_wrapper import CHAPKitRestAPIWrapper
+    from chap_core.models.external_chapkit_model import _parse_user_options_from_config_schema
+
+    client = CHAPKitRestAPIWrapper(service_url, timeout=5)
     try:
-        try:
-            configs = client.list_configs()
-        except Exception:
-            logger.debug("Could not fetch configs from %s, will retry next sync", service_url)
-            return
-
-        default_additional = _resolve_chapkit_default_additional_covariates(client)
-
-        if not configs:
-            session_wrapper.add_configured_model(
-                template_id,
-                ModelConfiguration(user_option_values={}, additional_continuous_covariates=default_additional),
-                "default",
-                uses_chapkit=True,
-            )
-            return
-
-        for cfg in configs:
-            # Chapkit manages its own config data; chap-core stores the
-            # configured model as a reference only, with empty user options.
-            # Carry over `additional_continuous_covariates` from the config's
-            # own data when present; otherwise fall back to the service-level
-            # default probed above.
-            cfg_data = getattr(cfg, "data", None) or {}
-            if hasattr(cfg_data, "model_dump"):
-                cfg_data = cfg_data.model_dump()
-            cfg_additional = list(cfg_data.get("additional_continuous_covariates", []) or []) or default_additional
-            session_wrapper.add_configured_model(
-                template_id,
-                ModelConfiguration(user_option_values={}, additional_continuous_covariates=cfg_additional),
-                cfg.name,
-                uses_chapkit=True,
-            )
+        return _parse_user_options_from_config_schema(client.get_config_schema())
     finally:
         client.close()
+
+
+def add_model_template_from_registered_service(session: Session, service) -> int:
+    """Store the template a registered chapkit service describes, from its live info and config schema.
+
+    What discovery does for a registered service; also an endpoint, so a service whose
+    schema was unreachable when it was discovered can be stored on demand. The service
+    must report a git revision, since a template without a digest could never run, and
+    a stored version must be the revision the service reports. A service cannot use the
+    name of a built-in baseline, whatever its version.
+    """
+    from chap_core.models.external_chapkit_model import ml_service_info_to_model_template_config
+
+    if _is_baseline_name(session, service.info.id):
+        raise BaselineTemplateConflict(service.info.id)
+    conflict = _registered_chapkit_revision_conflict(session, service.info)
+    if conflict is not None:
+        raise conflict
+    config = ml_service_info_to_model_template_config(service.info, service.url, _fetch_user_options(service.url))
+    wrapper = SessionWrapper(session=session)
+    template_id = wrapper.add_model_template_from_yaml_config(config, source_digest=service.info.git_revision)
+    # Which version is live follows the usual rule: a new version takes over from the
+    # previous live one once it has a configured model, so a service that comes up at a
+    # version nobody has configured yet does not hide the version people can run.
+    template = wrapper.get_model_template(template_id)
+    template.uses_chapkit = True
+    session.add(template)
+    session.commit()
+    return template_id
 
 
 router = APIRouter(prefix="/crud")
@@ -280,22 +289,127 @@ worker: CeleryPool[Any] = CeleryPool()
     tags=["Backtests"],
     summary="Browse stored evaluation runs",
 )  # This should be called list
-async def get_backtests(session: Session = Depends(get_session)):
-    """List every stored backtest so you can pick one to view, compare against another, plot metrics from, or promote into a saved prediction setup.
+async def get_backtests(
+    specification_id: Annotated[int | None, Query(alias="specificationId")] = None,
+    dataset_id: Annotated[int | None, Query(alias="datasetId")] = None,
+    session: Session = Depends(get_session),
+):
+    """List stored backtests so you can pick one to view, compare against another, plot metrics from, or promote into a saved prediction setup.
 
     Each entry carries enough metadata to identify it at a glance (dataset, model,
     periods, regions) but not the raw forecasts — fetch those via
-    ``/backtests/{id}/full`` only when you actually need them.
+    ``/backtests/{id}/full`` only when you actually need them. Filter by
+    ``specificationId`` to get the backtests that are comparable with each other, or by
+    ``datasetId`` for everything run against one dataset. Backtests of built-in baseline
+    models are reference results and are not listed.
     """
-    backtests = session.exec(
-        select(Backtest).options(
-            selectinload(Backtest.specification),  # type: ignore[arg-type]
-            selectinload(Backtest.dataset).defer(DataSet.geojson),  # type: ignore[arg-type]
-            selectinload(Backtest.configured_model).selectinload(ConfiguredModelDB.model_template),  # type: ignore[arg-type]
-            selectinload(Backtest.prediction_setup),  # type: ignore[arg-type]
+    query = select(Backtest).where(is_not_baseline_backtest()).options(*_backtest_read_loads())
+    if specification_id is not None:
+        query = query.where(Backtest.specification_id == specification_id)
+    if dataset_id is not None:
+        query = query.where(Backtest.dataset_id == dataset_id)
+    return session.exec(query).all()
+
+
+def _backtest_read_loads():
+    """Eager loads for everything `BacktestRead` reads off a `Backtest` row."""
+    return (
+        selectinload(Backtest.specification),  # type: ignore[arg-type]
+        selectinload(Backtest.dataset).defer(DataSet.geojson),  # type: ignore[arg-type]
+        selectinload(Backtest.configured_model).selectinload(ConfiguredModelDB.model_template),  # type: ignore[arg-type]
+        selectinload(Backtest.prediction_setup),  # type: ignore[arg-type]
+    )
+
+
+@router.get(
+    "/backtest-specifications",
+    response_model=list[BacktestSpecificationSummary],
+    tags=["Backtests"],
+    summary="List the evaluation setups backtests have run under",
+)
+def get_backtest_specifications(
+    filters: Annotated[BacktestSpecificationFilter, Query()],
+    session: Session = Depends(get_session),
+):
+    """List backtest specifications: a dataset plus the parameters that make backtests under it comparable.
+
+    A specification with several backtests under it is a benchmark. Filter by
+    ``datasetId``, ``targetColumn`` and any of the ``BacktestParams`` fields; the full tuple identifies at
+    most one specification, which is how an external system finds a benchmark again
+    without storing the specification id. Rows carry counts only; fetch
+    ``/backtest-specifications/{id}`` for the backtests themselves.
+    """
+    backtest_counts = (
+        select(Backtest.specification_id, func.count(col(Backtest.id)).label("backtest_count"))
+        .where(is_not_baseline_backtest())
+        .group_by(col(Backtest.specification_id))
+        .subquery()
+    )
+    query = (
+        select(BacktestSpecification, func.coalesce(backtest_counts.c.backtest_count, 0))
+        .outerjoin(backtest_counts, backtest_counts.c.specification_id == BacktestSpecification.id)
+        .options(selectinload(BacktestSpecification.dataset).defer(DataSet.geojson))  # type: ignore[arg-type]
+        .order_by(col(BacktestSpecification.id))
+    )
+    for name, value in filters.model_dump(exclude_none=True).items():
+        query = query.where(getattr(BacktestSpecification, name) == value)
+    return [
+        BacktestSpecificationSummary(
+            id=specification.id,
+            dataset=specification.dataset,
+            org_unit_count=len(specification.org_units),
+            backtest_count=backtest_count,
+            **_specification_params(specification),
         )
+        for specification, backtest_count in session.exec(query).all()
+    ]
+
+
+@router.get(
+    "/backtest-specifications/{specificationId}",
+    response_model=BacktestSpecificationRead,
+    tags=["Backtests"],
+    summary="Fetch a specification with every backtest under it",
+)
+def get_backtest_specification(
+    specification_id: Annotated[int, Path(alias="specificationId")],
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+    database_url: str = Depends(get_database_url),
+):
+    """Read one specification together with every backtest that ran under it, newest first, in a single response.
+
+    This is the benchmark leaderboard: each backtest row is the ``BacktestRead`` shape
+    with aggregate metrics, the configured model and its template, so a client can rank
+    models without a request per backtest. Forecasts and per-org-unit metrics are not
+    included, and neither are backtests of built-in baseline models. Baselines that have not
+    run on the specification yet are queued after the response is sent. 404 if the id is unknown.
+    """
+    specification = session.exec(
+        select(BacktestSpecification)
+        .where(BacktestSpecification.id == specification_id)
+        .options(selectinload(BacktestSpecification.dataset).defer(DataSet.geojson))  # type: ignore[arg-type]
+    ).first()
+    if specification is None:
+        raise HTTPException(status_code=404, detail="Backtest specification not found")
+    background_tasks.add_task(request_baselines_after_response, session.get_bind(), specification_id, database_url)
+    backtests = session.exec(
+        select(Backtest)
+        .where(Backtest.specification_id == specification_id, is_not_baseline_backtest())
+        .order_by(col(Backtest.created).desc().nulls_last(), col(Backtest.id).desc())
+        .options(*_backtest_read_loads())
     ).all()
-    return backtests
+    return BacktestSpecificationRead(
+        id=specification_id,
+        dataset=specification.dataset,
+        org_units=specification.org_units,
+        backtests=backtests,
+        **_specification_params(specification),
+    )
+
+
+def _specification_params(specification: BacktestSpecification) -> dict[str, Any]:
+    return {name: getattr(specification, name) for name in (*BacktestParams.model_fields, "target_column")}
 
 
 @router.get(
@@ -545,10 +659,21 @@ async def get_prediction(
 async def delete_prediction(
     prediction_id: Annotated[int, Path(alias="predictionId")], session: Session = Depends(get_session)
 ):
-    """Permanently delete a prediction and every forecast row it contains. Use this to clean up obsolete or test forecasts from the listing. 404 if the id is unknown."""
+    """Permanently delete a prediction and every forecast row it contains. Use this to clean up obsolete or test forecasts from the listing.
+
+    Refused with 409 while alerts raised from this prediction still exist: an alert
+    only means something alongside the forecast that justified it, so the alerts have
+    to go first. 404 if the id is unknown.
+    """
     prediction = session.get(Prediction, prediction_id)
     if prediction is None:
         raise HTTPException(status_code=404, detail="Prediction not found")
+    alerts = alert_service.list_alerts(session, prediction_id=prediction_id)
+    if alerts:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Prediction {prediction_id} has {len(alerts)} alert(s) raised from it; delete those first",
+        )
     session.delete(prediction)
     session.commit()
     return {"message": "deleted"}
@@ -599,7 +724,10 @@ async def get_dataset(dataset_id: Annotated[int, Path(alias="datasetId")], sessi
     summary="Import a health-only dataset",
 )
 async def create_dataset(
-    data: DatasetCreate, datababase_url=Depends(get_database_url), worker_settings=Depends(get_settings)
+    data: DatasetCreate,
+    original_request: dict = Depends(get_job_request),
+    datababase_url=Depends(get_database_url),
+    worker_settings=Depends(get_settings),
 ) -> JobResponse:
     """Import a dataset that carries just disease cases and population (no climate covariates inline), with polygons attached.
 
@@ -617,6 +745,7 @@ async def create_dataset(
         data.name,
         database_url=datababase_url,
         worker_config=worker_settings,
+        **{JOB_REQUEST_KW: original_request},
     )
     return JobResponse(id=job.id)
 
@@ -644,7 +773,7 @@ async def create_dataset_csv(
     geo_json_content = await geojson_file.read()
     features = Polygons.from_geojson(json.loads(geo_json_content), id_property="NAME_1").feature_collection()
     dataset_id = DataSetManager(session).save_dataset(
-        DataSetCreateInfo(name="csv_file"), dataset, features.model_dump_json()
+        DataSetCreateInfo(name="csv_file"), dataset, features.model_dump_json(), created_manually=True
     )
     return DataBaseResponse(id=dataset_id)
 
@@ -726,24 +855,90 @@ async def delete_dataset(dataset_id: Annotated[int, Path(alias="datasetId")], se
     tags=["Models"],
     summary="Browse available model templates",
 )
-async def list_model_templates(session: Session = Depends(get_session)):
+def list_model_templates(session: Session = Depends(get_session)):
     """List every live model template that can be configured into a runnable model — one per template name; superseded versions keep their rows but are not listed.
 
-    Acts as the discovery endpoint: it is also where the CHAPKit v2 service registry
-    gets pulled in, so a template's ``health_status = "live"`` reflects whether the
-    backing CHAPKit service is currently registered. Stale CHAPKit templates whose
-    services have disappeared are auto-archived as a side effect.
+    Acts as the discovery endpoint: registered CHAPKit services without a stored
+    template get one here, and a template's ``health_status`` reflects whether the
+    backing CHAPKit service is currently registered (``"live"``) and still runs the
+    stored source revision (``"revision_mismatch"`` otherwise). Discovery creates no
+    configured models; those come from the marketplace entry through
+    ``chap-admin install``. A newly discovered version of a stored template is listed
+    once it has a configured model.
     """
-    live_ids = _sync_live_chapkit_services(session)
+    conflicts = _sync_live_chapkit_services(session)
     model_templates = session.exec(select(ModelTemplateDB).where(ModelTemplateDB.is_live == True)).all()
 
     results = []
     for t in model_templates:
         read = ModelTemplateRead.model_validate(t)
-        if t.name in live_ids:
-            read.health_status = "live"
+        if (t.name, t.version) in conflicts:
+            read.health_status = LIVE if conflicts[(t.name, t.version)] is None else REVISION_MISMATCH
         results.append(read)
     return results
+
+
+@router.post(
+    "/model-templates/from-service",
+    response_model=ModelTemplateRead,
+    tags=["Models"],
+    summary="Store a model template from a registered CHAPKit service",
+)
+def add_model_template_from_service(
+    request: ModelTemplateFromService,
+    session: Session = Depends(get_session),
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+):
+    """Store the template a live CHAPKit service describes, read from its own info and config schema.
+
+    This is how ``chap-admin install`` registers a model once its service is up, and how
+    a custom image without a marketplace entry becomes a model in CHAP. A version is
+    write-once, so repeating the call returns the stored row (and shows it again if it
+    was retired). The ``role`` from the model's marketplace entry is set on the stored
+    template on every call. The service must be registered in the v2 service registry and
+    reachable. 404 if it is not registered, 409 if it reports no git revision or another
+    revision than the one stored under its version, or uses the name of a built-in
+    baseline, 502 if it cannot be read.
+    """
+    try:
+        service = orchestrator.get(request.service_id)
+    except ServiceNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    try:
+        template_id = add_model_template_from_registered_service(session, service)
+    except (ModelTemplateRevisionConflict, BaselineTemplateConflict) as conflict:
+        raise HTTPException(status_code=409, detail=str(conflict)) from conflict
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Could not read the service at {service.url}: {error}") from error
+    template = SessionWrapper(session=session).get_model_template(template_id)
+    template.role = request.role
+    session.add(template)
+    session.commit()
+    return ModelTemplateRead.model_validate(template)
+
+
+@router.delete(
+    "/model-templates/{modelTemplateId}",
+    tags=["Models"],
+    summary="Retire a model template",
+)
+def delete_model_template(
+    model_template_id: Annotated[int, Path(alias="modelTemplateId")],
+    all_versions: Annotated[bool, Query(alias="allVersions")] = False,
+    session: Session = Depends(get_session),
+):
+    """Hide a model template and its configured models from pickers, keeping the rows so historical backtests still resolve.
+
+    Retiring the live version makes the newest earlier version that can run live again.
+    With ``allVersions=true`` every version of the template's name is retired instead,
+    which is what ``chap-admin uninstall`` does. Storing the same name and version again
+    shows that version again. 404 if the id is unknown.
+    """
+    try:
+        SessionWrapper(session=session).archive_model_template(model_template_id, all_versions=all_versions)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return {"message": "deleted"}
 
 
 ###########
@@ -756,17 +951,29 @@ async def list_model_templates(session: Session = Depends(get_session)):
     tags=["Models"],
     summary="Browse configured (ready-to-run) models",
 )
-def list_configured_models(session: Session = Depends(get_session)):
+def list_configured_models(
+    session: Session = Depends(get_session), orchestrator: Orchestrator = Depends(get_registry_reader)
+):
     """List every configured model — a template + user-chosen options bundled into something you can actually run.
 
     Use this to populate model pickers in backtest / prediction creation flows. Each
     entry carries the configuration values along with template metadata so you can
     surface "Model X (CRPS-tuned, 12 lags, ERA5)" or similar in a UI.
+    Health is read from the service registry without syncing or archiving templates.
     """
-    configured_models_read = SessionWrapper(session=session).get_configured_models()
+    template_health: dict[tuple[str, str | None], Literal["live", "revision_mismatch"]] = {}
+    try:
+        services = orchestrator.get_all().services
+    except RedisError:
+        logger.debug("Could not reach service registry, configured model health is unknown")
+    except Exception:
+        logger.warning("Could not read service registry, configured model health is unknown", exc_info=True)
+    else:
+        for service in services:
+            conflict = _registered_chapkit_revision_conflict(session, service.info)
+            template_health[(service.info.id, service.info.version)] = LIVE if conflict is None else REVISION_MISMATCH
 
-    # return
-    return configured_models_read
+    return SessionWrapper(session=session).get_configured_models(template_health=template_health)
 
 
 @router.get(
@@ -854,6 +1061,221 @@ async def delete_configured_model(
 
 
 ###########
+# alerts
+
+
+@router.post(
+    "/alerts",
+    response_model=AlertIdsResponse,
+    tags=["Alerts"],
+    summary="Record alerts raised against a policy",
+)
+@api_experimental
+async def create_alerts(request: AlertsCreate, session: Session = Depends(get_session)):
+    """Record a batch of alerts — one run raises many at once, so they are written together.
+
+    Every alert names a level its policy actually defines; a level name only means
+    something against its policy. Alerts land in the `pending` state, waiting for a
+    reviewer to clear them for dissemination. The batch is validated before anything is
+    written, so it fails whole. A prediction raises at most one alert per org unit and
+    period, carrying the most severe level breached. 422 if a policy, level or
+    prediction is unknown, or the prediction already has an alert for that org unit and
+    period.
+    """
+    # AlertCreate and Alert share AlertBase, so the row is the create body plus the
+    # server-owned fields the service fills in.
+    alerts = [Alert(**entry.model_dump()) for entry in request.alerts]
+    try:
+        created = alert_service.create_alerts(session, alerts)
+    except alert_service.InvalidAlertError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return AlertIdsResponse(ids=[alert.id for alert in created if alert.id is not None])
+
+
+@router.get(
+    "/alerts",
+    response_model=list[AlertRead],
+    tags=["Alerts"],
+    summary="Browse alerts, or pull the review queue",
+)
+@api_experimental
+async def list_alerts(
+    alert_policy_id: Annotated[int | None, Query(alias="alertPolicyId")] = None,
+    prediction_id: Annotated[int | None, Query(alias="predictionId")] = None,
+    org_unit: Annotated[str | None, Query(alias="orgUnit")] = None,
+    approved: Annotated[AlertApproval | None, Query()] = None,
+    session: Session = Depends(get_session),
+):
+    """List alerts, narrowed by whichever filters you pass.
+
+    `approved=pending` is the review queue: everything nobody has decided on yet.
+    `approved=approved` is what dissemination should be sending.
+    """
+    return alert_service.list_alerts(
+        session,
+        alert_policy_id=alert_policy_id,
+        prediction_id=prediction_id,
+        org_unit=org_unit,
+        approved=approved,
+    )
+
+
+@router.get(
+    "/alerts/{alertId}",
+    response_model=AlertRead,
+    tags=["Alerts"],
+    summary="View one alert",
+)
+@api_experimental
+async def get_alert(
+    alert_id: Annotated[int, Path(alias="alertId")],
+    session: Session = Depends(get_session),
+):
+    """Read a single alert, including where it stands in the release gate. 404 if the id is unknown."""
+    try:
+        return alert_service.get_alert(session, alert_id)
+    except alert_service.AlertNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@router.delete(
+    "/alerts/{alertId}",
+    tags=["Alerts"],
+    summary="Remove an alert",
+)
+@api_experimental
+async def delete_alert(
+    alert_id: Annotated[int, Path(alias="alertId")],
+    session: Session = Depends(get_session),
+):
+    """Delete an alert, e.g. one raised by a bad run, so its prediction or policy can be deleted.
+
+    Refused with 409 once the alert is approved: it has been cleared for dissemination
+    and stays on record. 404 if the id is unknown.
+    """
+    try:
+        alert_service.delete_alert(session, alert_id)
+    except alert_service.AlertNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except alert_service.AlertApprovedError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"message": "deleted"}
+
+
+@router.post(
+    "/alerts/$approve",
+    response_model=list[AlertRead],
+    tags=["Alerts"],
+    summary="Clear a set of alerts for release, or decline them",
+)
+@api_experimental
+async def approve_alerts(request: AlertApprovalRequest, session: Session = Depends(get_session)):
+    """Move a set of alerts through the release gate in one go.
+
+    Reviewers work through a queue and decide on several alerts at a time, so the whole
+    set is applied atomically — if any id is unknown, nothing is written and you get a
+    404. `approved` clears them for dissemination; `declined` records a deliberate
+    decision not to release, so they do not come back around for re-triage.
+
+    This gate is about dissemination, not epidemiology: it says a human cleared the
+    alert to go out, not that the outbreak turned out to be real.
+    """
+    try:
+        return alert_service.set_approval(
+            session,
+            alert_ids=request.alert_ids,
+            approved=request.approved,
+            approved_by=request.approved_by,
+        )
+    except alert_service.AlertNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except alert_service.InvalidAlertError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+
+# alert policies
+
+
+@router.post(
+    "/alert-policies",
+    response_model=DataBaseResponse,
+    tags=["Alert Policies"],
+    summary="Define the tiers at which forecasts raise alerts",
+)
+@api_experimental
+async def create_alert_policy(request: AlertPolicyCreate, session: Session = Depends(get_session)):
+    """Create a named ladder of alert levels — a `monitor` tier, an `alert` tier, an `action` tier — that a prediction setup can be pointed at.
+
+    Each level pairs an epidemic channel (the same strategy and parameters
+    `POST /v1/analytics/thresholds` takes, with a single threshold line) with the
+    exceedance probability at or above which that tier fires, so one policy expresses a
+    whole escalation ladder. Levels are ordered from least to most severe. 422 if the
+    policy has no levels, an unnamed level, a level with more than one threshold line,
+    or two levels sharing a name.
+    """
+    try:
+        policy = alert_policy_service.create_alert_policy(session, name=request.name, levels=request.levels)
+    except alert_policy_service.InvalidAlertPolicyError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    if policy.id is None:
+        raise HTTPException(status_code=500, detail="AlertPolicy creation produced no id")
+    return DataBaseResponse(id=policy.id)
+
+
+@router.get(
+    "/alert-policies",
+    response_model=list[AlertPolicyRead],
+    tags=["Alert Policies"],
+    summary="Browse saved alert policies",
+)
+@api_experimental
+async def list_alert_policies(session: Session = Depends(get_session)):
+    """List every alert policy, so a UI can offer them when configuring a prediction setup."""
+    return alert_policy_service.list_alert_policies(session)
+
+
+@router.get(
+    "/alert-policies/{alertPolicyId}",
+    response_model=AlertPolicyRead,
+    tags=["Alert Policies"],
+    summary="View one alert policy and its levels",
+)
+@api_experimental
+async def get_alert_policy(
+    alert_policy_id: Annotated[int, Path(alias="alertPolicyId")],
+    session: Session = Depends(get_session),
+):
+    """Read a policy's levels, each with its channel parameters and the probability at which it fires. 404 if the id is unknown."""
+    try:
+        return alert_policy_service.get_alert_policy(session, alert_policy_id)
+    except alert_policy_service.AlertPolicyNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@router.delete(
+    "/alert-policies/{alertPolicyId}",
+    tags=["Alert Policies"],
+    summary="Remove an alert policy",
+)
+@api_experimental
+async def delete_alert_policy(
+    alert_policy_id: Annotated[int, Path(alias="alertPolicyId")],
+    session: Session = Depends(get_session),
+):
+    """Delete a policy no prediction setup points at.
+
+    Refused with 409 while a setup still references it, so a running forecast cannot
+    lose the definition of what counts as an alert. 404 if the id is unknown.
+    """
+    try:
+        alert_policy_service.delete_alert_policy(session, alert_policy_id)
+    except alert_policy_service.AlertPolicyNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except alert_policy_service.AlertPolicyInUseError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"message": "deleted"}
+
+
 # prediction setups
 
 
@@ -863,7 +1285,6 @@ async def delete_configured_model(
     tags=["Prediction Setups"],
     summary="Promote a backtest into a reusable prediction config",
 )
-@api_experimental
 async def create_prediction_setup(request: PredictionSetupCreate, session: Session = Depends(get_session)):
     """Save a backtest as a prediction setup — a named configuration you can rerun on fresh data, either ad-hoc via ``/run`` or on a cron schedule.
 
@@ -880,8 +1301,11 @@ async def create_prediction_setup(request: PredictionSetupCreate, session: Sessi
             schedule_cron_expression=request.schedule_cron_expression,
             schedule_enabled=request.schedule_enabled,
             quantile_targets=request.quantile_targets,
+            alert_policy_id=request.alert_policy_id,
         )
     except prediction_setup_service.BacktestNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except prediction_setup_service.AlertPolicyNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except prediction_setup_service.DuplicateSetupError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
@@ -898,7 +1322,6 @@ async def create_prediction_setup(request: PredictionSetupCreate, session: Sessi
     tags=["Prediction Setups"],
     summary="Browse saved prediction setups",
 )
-@api_experimental
 async def list_prediction_setups(session: Session = Depends(get_session)):
     """List every prediction setup so you can manage them, run them ad-hoc, or check which backtests have been promoted into a recurring forecast.
 
@@ -915,7 +1338,6 @@ async def list_prediction_setups(session: Session = Depends(get_session)):
     tags=["Prediction Setups"],
     summary="View a prediction setup with its forecast history",
 )
-@api_experimental
 async def get_prediction_setup(
     prediction_setup_id: Annotated[int, Path(alias="predictionSetupId")],
     session: Session = Depends(get_session),
@@ -936,7 +1358,6 @@ async def get_prediction_setup(
     tags=["Prediction Setups"],
     summary="Tweak a prediction setup's schedule or targets",
 )
-@api_experimental
 async def update_prediction_setup(
     prediction_setup_id: Annotated[int, Path(alias="predictionSetupId")],
     request: PredictionSetupUpdate,
@@ -951,6 +1372,8 @@ async def update_prediction_setup(
     try:
         return prediction_setup_service.update_prediction_setup(session, prediction_setup_id, update_data)
     except prediction_setup_service.PredictionSetupNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except prediction_setup_service.AlertPolicyNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except prediction_setup_service.InvalidSetupError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -984,7 +1407,7 @@ def _cancel_jobs_for_prediction_setup(prediction_setup_id: int) -> None:
                 logger.warning(
                     "Failed to cancel job %s for prediction setup %d", task_id, prediction_setup_id, exc_info=True
                 )
-        redis.delete(key)
+        redis.delete(key, f"job_request:{task_id}")
 
 
 @router.delete(
@@ -992,7 +1415,6 @@ def _cancel_jobs_for_prediction_setup(prediction_setup_id: int) -> None:
     tags=["Prediction Setups"],
     summary="Retire a prediction setup",
 )
-@api_experimental
 async def delete_prediction_setup(
     prediction_setup_id: Annotated[int, Path(alias="predictionSetupId")],
     session: Session = Depends(get_session),
@@ -1023,10 +1445,10 @@ async def delete_prediction_setup(
     tags=["Prediction Setups"],
     summary="Run a prediction setup against fresh observations",
 )
-@api_experimental
 async def run_prediction_setup(
     prediction_setup_id: Annotated[int, Path(alias="predictionSetupId")],
     request: RunPredictionSetupRequest,
+    original_request: dict = Depends(get_job_request),
     session: Session = Depends(get_session),
     database_url: str = Depends(get_database_url),
     worker_settings=Depends(get_settings),
@@ -1037,7 +1459,8 @@ async def run_prediction_setup(
     arrived, a model investigation, etc.). Returns a job id; track it via
     ``/v1/jobs/{id}`` or filter the jobs list with ``predictionSetupId`` to see every
     job this setup has launched. Returns 404 if the setup is unknown, 409 if its
-    configured model has been archived, 422 if ``provided_data`` is empty.
+    configured model has been archived, 422 if ``provided_data`` is empty or missing
+    the backtest's target column. Forecasts use the same target as the backtest.
     """
     try:
         setup = prediction_setup_service.get_prediction_setup(session, prediction_setup_id)
@@ -1058,12 +1481,18 @@ async def run_prediction_setup(
     if not request.provided_data:
         raise HTTPException(status_code=422, detail="provided_data cannot be empty")
 
+    target_column = setup.backtest.specification.target_column
     feature_names = list({entry.feature_name for entry in request.provided_data})
+    if target_column not in feature_names:
+        raise HTTPException(status_code=422, detail=f"Dataset has no target column {target_column!r}")
     dataclass = create_tsdataclass(feature_names)
     provided_data = observations_to_dataset(dataclass, request.provided_data, fill_missing=True)
     if "population" in feature_names:
         provided_data = provided_data.interpolate(["population"])
-    provided_data, rejections = validate_full_dataset(feature_names, provided_data)
+    # disease_cases is replaced by the selected target before training, so neither
+    # column should be validated as a covariate.
+    covariates = [name for name in feature_names if name not in (target_column, "disease_cases")]
+    provided_data, rejections = validate_full_dataset(covariates, provided_data)
     if rejections:
         logger.warning(
             "%d observations rejected for prediction-setup %d",
@@ -1102,8 +1531,9 @@ async def run_prediction_setup(
         prediction_params=prediction_params,
         prediction_setup_id=prediction_setup_id,
         configured_model_id=setup.configured_model_id,
+        target_column=target_column,
         database_url=database_url,
         worker_config=worker_settings,
-        **{JOB_TYPE_KW: JobType.PREDICTION, JOB_NAME_KW: request.name},
+        **{JOB_REQUEST_KW: original_request, JOB_TYPE_KW: JobType.PREDICTION, JOB_NAME_KW: request.name},
     )
     return JobResponse(id=job.id)

@@ -161,6 +161,8 @@ class TestOpenAPITags:
             "Datasets",
             "Models",
             "Prediction Setups",
+            "Alerts",
+            "Alert Policies",
             "Visualizations",
             "Jobs",
             "Services",
@@ -209,6 +211,11 @@ class TestOpenAPIOperationIds:
         schema = client.get("/openapi.json").json()
 
         assert "/v2/services/{service_id}/run/{path}" not in schema["paths"]
+
+    def test_make_prediction_is_deprecated(self, client):
+        schema = client.get("/openapi.json").json()
+
+        assert schema["paths"]["/v1/analytics/make-prediction"]["post"]["deprecated"] is True
 
 
 class TestDocs:

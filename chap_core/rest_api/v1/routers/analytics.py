@@ -2,7 +2,6 @@ import logging
 from typing import Annotated, Any
 
 import numpy as np
-import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import Field as PydanticField
 from sqlalchemy.orm import selectinload
@@ -18,24 +17,33 @@ from chap_core.api_types import (
     PredictionEntry,
 )
 from chap_core.assessment.dataset_splitting import train_test_generator
-from chap_core.assessment.thresholds import get_threshold_strategy, list_threshold_strategies
+from chap_core.assessment.thresholds import list_threshold_strategies
 from chap_core.assessment.thresholds.params import ThresholdParams
 from chap_core.assessment.weather_providers import list_weather_providers
 from chap_core.database.base_tables import DBModel
+from chap_core.database.database import SessionWrapper
 from chap_core.database.dataset_manager import DataSetManager
 from chap_core.database.dataset_tables import DataSet as DataSetTable
 from chap_core.database.dataset_tables import DataSetCreateInfo
 from chap_core.database.model_templates_and_config_tables import ConfiguredModelDB, ModelTemplateDB
-from chap_core.database.tables import Backtest, BacktestForecast, Prediction
+from chap_core.database.tables import (
+    Backtest,
+    BacktestForecast,
+    BacktestSpecification,
+    Prediction,
+    is_not_baseline_backtest,
+)
 from chap_core.datatypes import create_tsdataclass
+from chap_core.services import threshold_service
 from chap_core.services.dataset_validation import RESERVED_FIELDS
-from chap_core.spatio_temporal_data.converters import observations_to_dataframe, observations_to_dataset
+from chap_core.spatio_temporal_data.converters import observations_to_dataset
 from chap_core.spatio_temporal_data.temporal_dataclass import DataSet
 
-from ...celery_tasks import JOB_NAME_KW, JOB_TYPE_KW, CeleryPool, JobType
+from ...celery_tasks import JOB_NAME_KW, JOB_REQUEST_KW, JOB_TYPE_KW, CeleryPool, JobType
 from ...data_models import (
     BacktestCreate,
     BacktestDomain,
+    BacktestJob,
     BacktestRead,
     ChapDataSource,
     CovariateNameSuggestion,
@@ -43,12 +51,14 @@ from ...data_models import (
     ImportSummaryResponse,
     JobResponse,
     MakeBacktestRequest,
+    MakeBacktestsRequest,
+    MakeBacktestsResponse,
     MakeBacktestWithDataRequest,
     MakePredictionRequest,
     PredictionParams,
     ValidationError,
 )
-from .dependencies import get_database_url, get_session, get_settings
+from .dependencies import get_database_url, get_job_request, get_session, get_settings
 
 router = APIRouter(prefix="/analytics")
 
@@ -63,7 +73,13 @@ worker: CeleryPool[Any] = CeleryPool()
     summary="Import observations as a reusable dataset",
 )
 def make_dataset(
-    request: DatasetMakeRequest, database_url: str = Depends(get_database_url), worker_settings=Depends(get_settings)
+    request: DatasetMakeRequest,
+    original_request: dict = Depends(get_job_request),
+    dry_run: bool = Query(
+        False, description="If True, only run validation and do not import the dataset", alias="dryRun"
+    ),
+    database_url: str = Depends(get_database_url),
+    worker_settings=Depends(get_settings),
 ):
     """Persist observations (with polygons) as a named dataset you can reuse across backtests and predictions.
 
@@ -71,19 +87,13 @@ def make_dataset(
     stored, so a single dataset can back multiple evaluations. Import happens in the
     background — the response gives you a job id plus a per-location rejection summary
     (validation runs synchronously, the harmonise-and-load step async). Poll
-    ``/v1/jobs/{id}`` to know when the dataset is queryable.
+    ``/v1/jobs/{id}`` to know when the dataset is queryable. Pass ``dryRun=true`` to run
+    validation only and get the rejection summary without queuing an import.
     """
-    feature_names, provided_data = _read_dataset(request)
-    provided_data, rejections = validate_full_dataset(feature_names, provided_data)
-    # provided_field_names = {entry.element_id: entry.element_name for entry in request.provided_data}
-    polygon_rejected = provided_data.set_polygons(FeatureCollectionModel.model_validate(request.geojson))
-    rejections.extend(
-        ValidationError(reason="Missing polygon in geojson", orgUnit=location, feature_name="polygon", time_periods=[])
-        for location in polygon_rejected
-    )
+    feature_names, provided_data, rejections = _read_and_validate_dataset(request, dry_run)
     imported_count = len(list(provided_data.locations()))
-    if imported_count == 0:
-        raise HTTPException(status_code=500, detail="Missing values. No data was imported.")
+    if dry_run:
+        return ImportSummaryResponse(id=None, imported_count=imported_count, rejected=rejections)
     request.type = "evaluation"
 
     job = worker.queue_db(
@@ -96,10 +106,44 @@ def make_dataset(
         data_sources=request.data_sources,
         database_url=database_url,
         worker_config=worker_settings,
-        **{JOB_TYPE_KW: JobType.DATASET, JOB_NAME_KW: request.name},
+        **{JOB_REQUEST_KW: original_request, JOB_TYPE_KW: JobType.DATASET, JOB_NAME_KW: request.name},
     )
 
     return ImportSummaryResponse(id=job.id, imported_count=imported_count, rejected=rejections)
+
+
+def _read_and_validate_dataset(request, dry_run: bool) -> tuple[list[str], DataSet, list[ValidationError]]:
+    """Read the observations, drop locations with incomplete covariates, then drop locations without a polygon.
+
+    Outside a dry run, an empty result raises. In a dry run, every rejection is returned instead
+    (with an empty dataset) so the client can inspect the summary.
+    """
+    try:
+        feature_names, provided_data = _read_dataset(request)
+        provided_data, rejections = validate_full_dataset(feature_names, provided_data)
+    except HTTPException as exc:
+        if not dry_run or exc.status_code != 400:
+            raise
+        # Rejections, when present, were serialised by `validate_full_dataset` into
+        # `exc.detail["rejected"]`. The empty-`provided_data` case in `_read_dataset`
+        # raises with a plain-string detail and has no rejections to recover. If
+        # either helper changes its detail shape, this branch must be updated.
+        rejected: list = exc.detail.get("rejected", []) if isinstance(exc.detail, dict) else []
+        return [], DataSet({}), [ValidationError.model_validate(r) for r in rejected]
+    polygon_rejected = provided_data.set_polygons(FeatureCollectionModel.model_validate(request.geojson))
+    rejections.extend(
+        ValidationError(reason="Missing polygon in geojson", orgUnit=location, feature_name="polygon", time_periods=[])
+        for location in polygon_rejected
+    )
+    if not dry_run and not provided_data.locations():
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Missing values. No data was imported.",
+                "rejected": [r.model_dump(by_alias=True) for r in rejections],
+            },
+        )
+    return feature_names, provided_data, rejections
 
 
 def _read_dataset(request):
@@ -222,7 +266,13 @@ def get_compatible_backtests(
     org_units = set(backtest.org_units)
     split_periods = set(backtest.split_periods)
     res = session.exec(
-        select(Backtest.id, Backtest.org_units, Backtest.split_periods).where(Backtest.id != backtest_id)
+        select(Backtest.id, Backtest.org_units, Backtest.split_periods)
+        .join(BacktestSpecification)
+        .where(
+            Backtest.id != backtest_id,
+            BacktestSpecification.target_column == backtest.specification.target_column,
+            is_not_baseline_backtest(),
+        )
     ).all()
     ids = [bt_id for bt_id, o, s in res if set(o) & org_units and set(s) & split_periods]
     backtests = session.exec(
@@ -386,6 +436,7 @@ async def get_evaluation_entries(
 )
 async def create_backtest(
     request: MakeBacktestRequest,
+    original_request: dict = Depends(get_job_request),
     database_url: str = Depends(get_database_url),
     session: Session = Depends(get_session),
 ):
@@ -393,10 +444,13 @@ async def create_backtest(
 
     Runs asynchronously; you get a job id and poll ``/v1/jobs/{id}`` (or
     ``/v1/jobs/{id}/evaluation_result`` once finished) to find the resulting backtest.
-    404 if the referenced dataset does not exist.
+    404 if the referenced dataset does not exist; 422 if targetColumn is not a dataset column.
     """
-    if session.get(DataSetTable, request.dataset_id) is None:
+    stored_dataset = session.get(DataSetTable, request.dataset_id)
+    if stored_dataset is None:
         raise HTTPException(status_code=404, detail=f"Dataset {request.dataset_id} not found")
+    if request.target_column not in stored_dataset.covariates:
+        raise HTTPException(status_code=422, detail=f"Dataset has no target column {request.target_column!r}")
     job = worker.queue_db(
         wf.run_backtest,
         BacktestCreate(name=request.name, dataset_id=request.dataset_id, model_id=request.model_id),
@@ -405,29 +459,91 @@ async def create_backtest(
         stride=request.stride,
         n_retrain=request.n_retrain,
         future_weather_provider=request.future_weather_provider,
+        target_column=request.target_column,
+        baseline_database_url=database_url,
         database_url=database_url,
-        **{JOB_TYPE_KW: JobType.EVALUATION_LEGACY, JOB_NAME_KW: request.name},
+        **{JOB_REQUEST_KW: original_request, JOB_TYPE_KW: JobType.EVALUATION_LEGACY, JOB_NAME_KW: request.name},
     )
 
     return JobResponse(id=job.id)
 
 
 @router.post(
+    "/create-backtests",
+    response_model=MakeBacktestsResponse,
+    tags=["Backtests"],
+    summary="Run several configured models under one evaluation specification",
+)
+def create_backtests(
+    request: MakeBacktestsRequest,
+    original_request: dict = Depends(get_job_request),
+    database_url: str = Depends(get_database_url),
+    session: Session = Depends(get_session),
+):
+    """Evaluate a set of configured models on one stored dataset with one set of parameters, so the resulting backtests are comparable by construction.
+
+    The specification is resolved up front and one job is queued per model; a model
+    failing does not affect the others. The response carries the specification id, under
+    which every backtest of the run files, so the results can be fetched from
+    ``GET /v1/crud/backtest-specifications/{id}`` without a second lookup, plus one job id
+    per model to poll via ``/v1/jobs/{id}``. 404 if the dataset or a model does not exist,
+    422 if targetColumn is not a dataset column or no org unit has target data left to train on.
+    """
+    if session.get(DataSetTable, request.dataset_id) is None:
+        raise HTTPException(status_code=404, detail=f"Dataset {request.dataset_id} not found")
+    wrapper = SessionWrapper(session=session)
+    try:
+        models = [wrapper.get_configured_model_by_id_or_name(model_id) for model_id in request.model_ids]
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    params = BacktestParams(**request.model_dump(include=set(BacktestParams.model_fields)))
+    dataset = DataSetManager(session).to_dataset(request.dataset_id)
+    try:
+        _, specification = wf.resolve_backtest_specification(
+            wrapper, dataset, request.dataset_id, params, target_column=request.target_column
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    jobs = []
+    for model in models:
+        assert model.id is not None
+        name = f"{request.name}/{model.name}"
+        job = worker.queue_db(
+            wf.run_backtest,
+            BacktestCreate(name=name, dataset_id=request.dataset_id, model_id=model.id),
+            **params.model_dump(),
+            target_column=request.target_column,
+            baseline_database_url=database_url,
+            database_url=database_url,
+            **{JOB_REQUEST_KW: original_request, JOB_TYPE_KW: JobType.EVALUATION_LEGACY, JOB_NAME_KW: name},
+        )
+        jobs.append(BacktestJob(configured_model_id=model.id, job_id=job.id))
+    assert specification.id is not None
+    return MakeBacktestsResponse(specification_id=specification.id, jobs=jobs)
+
+
+@router.post(
     "/make-prediction",
     response_model=JobResponse,
     tags=["Predictions"],
-    summary="Run a one-off forecast from inline data",
+    deprecated=True,
+    summary="Run a one-off forecast from inline data (deprecated, use prediction setups)",
 )
 async def make_prediction(
-    request: MakePredictionRequest, database_url=Depends(get_database_url), worker_settings=Depends(get_settings)
+    request: MakePredictionRequest,
+    original_request: dict = Depends(get_job_request),
+    database_url=Depends(get_database_url),
+    worker_settings=Depends(get_settings),
 ):
     """Run a forecast against observations supplied directly in the request body — no stored dataset needed.
 
-    Use this for ad-hoc work when DHIS2 (or another source) already has the data and you
-    want it run through a configured model once. Forecasting happens in the background;
-    the response carries a job id you poll via ``/v1/jobs/{id}`` for the result. For a
-    recurring or scheduled version of the same workflow, use a prediction setup. The
-    legacy ``data_to_be_fetched`` field is rejected — supply the observations directly.
+    Deprecated: use ``POST /v1/crud/prediction-setups/{predictionSetupId}/run`` instead.
+    Predictions made here are not linked to a prediction setup, so they cannot be
+    monitored against observed cases.
+
+    Forecasting happens in the background; the response carries a job id you poll via
+    ``/v1/jobs/{id}`` for the result. The legacy ``data_to_be_fetched`` field is
+    rejected — supply the observations directly.
     """
     request.type = "prediction"
     feature_names = list({entry.feature_name for entry in request.provided_data})
@@ -451,7 +567,7 @@ async def make_prediction(
         prediction_params=prediction_params,
         database_url=database_url,
         worker_config=worker_settings,
-        **{JOB_TYPE_KW: JobType.PREDICTION, JOB_NAME_KW: request.name},
+        **{JOB_REQUEST_KW: original_request, JOB_TYPE_KW: JobType.PREDICTION, JOB_NAME_KW: request.name},
     )
     return JobResponse(id=job.id)
 
@@ -520,18 +636,20 @@ async def get_actual_cases(
     if org_units is not None and len(org_units) == 1 and org_units[0] == "adm0":
         # returning sum of forecasts for all regions
         return_summed = True
+    target_column = "disease_cases"
     if not is_dataset_id:
         backtest = session.get(Backtest, backtest_id)
         logger.info(f"Backtest: {backtest}")
         if backtest is None:
             raise HTTPException(status_code=404, detail="Backtest not found")
         dataset_id = backtest.dataset_id
+        target_column = backtest.specification.target_column
     else:
         dataset_id = backtest_id
     observations = DataSetManager(session).observations(
         dataset_id,
         org_units=None if return_summed else org_units,
-        feature_names=["disease_cases"],
+        feature_names=[target_column],
     )
     logger.info(f"Observations: {observations}")
     data_list = [
@@ -701,6 +819,7 @@ async def get_covariate_names(session: Session = Depends(get_session)) -> list[C
 )
 async def create_backtest_with_data(
     request: MakeBacktestWithDataRequest,
+    original_request: dict = Depends(get_job_request),
     dry_run: bool = Query(
         False, description="If True, only run validation and do not create a backtest", alias="dryRun"
     ),
@@ -715,18 +834,9 @@ async def create_backtest_with_data(
     real run returns a job id; poll ``/v1/jobs/{id}`` for status. The response also
     surfaces any per-location rejections that came out of validation.
     """
-    try:
-        feature_names, provided_data_processed = _read_dataset(request)
-        provided_data_processed, rejections = validate_full_dataset(feature_names, provided_data_processed)
-    except HTTPException as exc:
-        if not dry_run or exc.status_code != 400:
-            raise
-        # Rejections, when present, were serialised by `validate_full_dataset` into
-        # `exc.detail["rejected"]`. The empty-`provided_data` case in `_read_dataset`
-        # raises with a plain-string detail and has no rejections to recover. If
-        # either helper changes its detail shape, this branch must be updated.
-        rejected: list = exc.detail.get("rejected", []) if isinstance(exc.detail, dict) else []
-        return ImportSummaryResponse.model_validate({"id": None, "imported_count": 0, "rejected": rejected})
+    feature_names, provided_data_processed, rejections = _read_and_validate_dataset(request, dry_run)
+    if dry_run and not provided_data_processed.locations():
+        return ImportSummaryResponse(id=None, imported_count=0, rejected=rejections)
     backtest_params = BacktestParams(**request.model_dump())
     train_set, _ = train_test_generator(
         provided_data_processed, backtest_params.n_periods, backtest_params.n_splits, stride=backtest_params.stride
@@ -734,11 +844,6 @@ async def create_backtest_with_data(
     locations_to_keep, target_rejections = _find_locations_with_target_data(train_set)
     provided_data_processed = _filter_dataset_by_locations(provided_data_processed, locations_to_keep)
     rejections.extend(target_rejections)
-    polygon_rejected = provided_data_processed.set_polygons(FeatureCollectionModel.model_validate(request.geojson))
-    rejections.extend(
-        ValidationError(reason="Missing polygon in geojson", orgUnit=location, feature_name="polygon", time_periods=[])
-        for location in polygon_rejected
-    )
     imported_count = len(list(provided_data_processed.locations()))
     if dry_run:
         return ImportSummaryResponse(id=None, imported_count=imported_count, rejected=rejections)
@@ -748,7 +853,7 @@ async def create_backtest_with_data(
             status_code=500,
             detail={
                 "message": "Missing values. No data was imported.",
-                "rejected": [r.model_dump() for r in rejections],
+                "rejected": [r.model_dump(by_alias=True) for r in rejections],
             },
         )
 
@@ -773,7 +878,8 @@ async def create_backtest_with_data(
         backtest_params=bt_params,
         database_url=database_url,
         worker_config=worker_settings,
-        **{JOB_TYPE_KW: JobType.EVALUATION, JOB_NAME_KW: request.name},
+        baseline_database_url=database_url,
+        **{JOB_REQUEST_KW: original_request, JOB_TYPE_KW: JobType.EVALUATION, JOB_NAME_KW: request.name},
     )
     job_id = job.id
     return ImportSummaryResponse(id=job_id, imported_count=imported_count, rejected=rejections)
@@ -827,6 +933,43 @@ class ThresholdStrategyInfo(DBModel):
     id: str = Field(description="Canonical strategy identifier used in request bodies.")
     display_name: str = Field(description="Human-friendly strategy name shown in pickers.")
     description: str = Field(default="", description="Short paragraph explaining what the strategy computes.")
+
+
+class BacktestParameterInfo(DBModel):
+    """Default value and display metadata for one backtest parameter."""
+
+    name: str = Field(description="CamelCase parameter name used in request bodies.")
+    label: str = Field(description="Human-friendly label shown in forms.")
+    description: str = Field(description="Short help text for the parameter.")
+    default: int | str = Field(description="Value used when the parameter is omitted.")
+    type: str = Field(description="JSON Schema type of the parameter.")
+    minimum: int | None = Field(default=None, description="Inclusive lower bound, when applicable.")
+
+
+@router.get(
+    "/backtest-parameters",
+    response_model=list[BacktestParameterInfo],
+    response_model_exclude_none=True,
+    tags=["Backtests"],
+    summary="Discover backtest parameter defaults and display metadata",
+)
+def list_backtest_parameters():
+    """Populate a backtest form from the same field definitions used to validate requests.
+
+    Use `GET /v1/analytics/weather-providers` to populate the `futureWeatherProvider` picker.
+    """
+    properties = BacktestParams.model_json_schema(by_alias=False)["properties"]
+    return [
+        BacktestParameterInfo(
+            name=field.alias or name,
+            label=properties[name]["title"],
+            description=field.description,
+            default=field.default,
+            type=properties[name]["type"],
+            minimum=properties[name].get("minimum"),
+        )
+        for name, field in BacktestParams.model_fields.items()
+    ]
 
 
 class WeatherProviderInfo(DBModel):
@@ -899,36 +1042,21 @@ def compute_thresholds(request: ThresholdRequest, session: Session = Depends(get
     no `disease_cases` observations. 400 if the requested periods do not match the dataset's
     frequency, or if the dataset has no complete year to compute a baseline from.
     """
-    strategy_cls = get_threshold_strategy(request.params.type)
-    if strategy_cls is None:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Threshold strategy {request.params.type} is in the request schema but not registered",
-        )
-
-    observations = DataSetManager(session).observations(
-        request.dataset_id, org_units=request.locations or None, feature_names=["disease_cases"]
-    )
-    if not observations:
-        raise HTTPException(
-            status_code=404, detail=f"No disease_cases observations found for dataset {request.dataset_id}"
-        )
-
-    df = observations_to_dataframe(observations).rename(columns={"value": "disease_cases"})[
-        ["location", "time_period", "disease_cases"]
-    ]
     try:
-        result = strategy_cls().compute(df, request.period_ids, request.params)
-    except ValueError as e:
+        result = threshold_service.compute_thresholds(
+            session, request.dataset_id, request.period_ids, request.params, request.locations
+        )
+    except threshold_service.NoObservationsError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except threshold_service.UnknownStrategyError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    except threshold_service.InvalidThresholdInputError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     lines = request.params.lines
-    locations = request.locations or sorted(df["location"].unique())
-    grid = pd.MultiIndex.from_product(
-        [request.period_ids, locations, range(len(lines))], names=["period_id", "location", "line"]
-    )
-    thresholds = result.set_index(["period_id", "location", "line"])["threshold"].reindex(grid)
-    # reindex keeps the grid's period-major, then location, then line ordering
+    locations = request.locations or list(result["location"].unique())
+    thresholds = result["threshold"]
+    # The service returns rows in period, location, then line order.
     values = thresholds.to_numpy(dtype=float).reshape(len(request.period_ids), len(locations), len(lines))
     entries = [
         ThresholdEntry(

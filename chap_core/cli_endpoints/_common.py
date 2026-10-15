@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -12,12 +13,51 @@ if TYPE_CHECKING:
     from chap_core.api_types import BacktestParams, EstimatorOptions
     from chap_core.database.model_templates_and_config_tables import ModelConfiguration
     from chap_core.external.model_configuration import ModelTemplateConfigV2
-    from chap_core.hpo.hpoModel import HpoModel
+    from chap_core.hpo.hyperparameter_optimizer import HyperparameterOptimizer
     from chap_core.models.external_model import ExternalModel
     from chap_core.models.model_template import ModelTemplate
     from chap_core.spatio_temporal_data.temporal_dataclass import DataSet
+    from chap_core.time_period import TimePeriod
 
 logger = logging.getLogger(__name__)
+
+_RELATIVE_PERIOD_RE = re.compile(r"[+-]\d+")
+
+
+def resolve_period_arg(value: str, available_periods: Any, arg_name: str) -> TimePeriod:
+    """Resolve a period CLI argument to a TimePeriod.
+
+    `value` is either an exact period string (e.g. "2023-01", "2023W01", "2023"), or a relative
+    index into the sorted unique periods in `available_periods`:
+      - "-n": the n-th period from the end (n >= 1; "-1" is the last period).
+      - "+n": the n-th period from the start (n >= 1; "+1" is the first period).
+
+    Logs the resolved period at INFO level.
+    """
+    from typing import cast
+
+    from chap_core.time_period import TimePeriod
+
+    stripped = value.strip()
+    if _RELATIVE_PERIOD_RE.fullmatch(stripped):
+        sign, n = stripped[0], int(stripped[1:])
+        if n < 1:
+            raise ValueError(f"{arg_name}: relative period index must be at least 1 (got '{value}')")
+        all_periods = sorted(available_periods)
+        sorted_periods = [p for i, p in enumerate(all_periods) if i == 0 or p != all_periods[i - 1]]
+        if not sorted_periods:
+            raise ValueError(f"{arg_name}: no periods available in dataset to resolve '{value}' against")
+        if n > len(sorted_periods):
+            raise ValueError(
+                f"{arg_name}: only {len(sorted_periods)} distinct periods in dataset, cannot resolve '{value}'"
+            )
+        resolved: TimePeriod = sorted_periods[-n] if sign == "-" else sorted_periods[n - 1]
+        logger.info("%s: resolved relative period '%s' to %s", arg_name, value, resolved)
+        return resolved
+
+    resolved = cast("TimePeriod", TimePeriod.parse(stripped))
+    logger.info("%s: resolved to period %s", arg_name, resolved)
+    return resolved
 
 
 def append_to_csv(file_object, data_frame: pd.DataFrame):
@@ -240,9 +280,15 @@ def get_configuration(
 def get_estimator(
     template: ModelTemplate,
     configuration: ModelConfiguration | None,
+    prediction_length: int | None = None,
 ) -> ExternalModel:
-    """Build a plain estimator from a model template and optional configuration."""
-    model = template.get_model(configuration)  # type: ignore[arg-type]
+    """Build a plain estimator from a model template and optional configuration.
+
+    ``prediction_length`` is the forecast horizon the estimator will be asked for.
+    Models that need it before predicting, such as chapkit services that resolve the
+    horizon when training, get it through the template.
+    """
+    model = template.get_model(configuration, prediction_length=prediction_length)  # type: ignore[arg-type]
     estimator: ExternalModel = model()  # type: ignore[assignment]
     return estimator
 
@@ -251,6 +297,7 @@ def warn_unused_covariates(
     dataset: DataSet,
     template_config: ModelTemplateConfigV2,
     configuration: ModelConfiguration | None = None,
+    estimator: object | None = None,
 ) -> None:
     """Check for unused dataset columns and log each one as a warning.
 
@@ -268,11 +315,19 @@ def warn_unused_covariates(
         Optional per-run model configuration. When present, its
         additional_continuous_covariates are forwarded to the validation so explicitly
         configured extra columns are not flagged as unused.
+    estimator : object | None
+        Optional estimator built from the configuration. For a chapkit model, the
+        covariates its service stored are counted as used, since a service fills in its
+        own default when the configuration lists none.
     """
+    from chap_core.models.external_chapkit_model import ExternalChapkitModel
     from chap_core.services.dataset_validation import check_unused_covariates
 
     additional = configuration.additional_continuous_covariates if configuration is not None else None
-    issues = check_unused_covariates(dataset, template_config, additional)
+    model_covariates = (
+        estimator.additional_continuous_covariates if isinstance(estimator, ExternalChapkitModel) else None
+    )
+    issues = check_unused_covariates(dataset, template_config, additional, model_covariates)
     for issue in issues:
         logger.warning(issue.message)
 
@@ -283,7 +338,7 @@ def get_hpo_estimator(
     configuration: ModelConfiguration | None,
     backtest_params: BacktestParams,
     options: EstimatorOptions,
-) -> HpoModel:
+) -> HyperparameterOptimizer:
     """
     Build an HPO-backend estimator from either:
     - an explicit YAML search space, or
@@ -292,11 +347,10 @@ def get_hpo_estimator(
     import yaml
 
     from chap_core.api_types import SearcherType
-    from chap_core.hpo.base import load_search_space_from_config
-    from chap_core.hpo.hpoModel import HpoModel
+    from chap_core.hpo.hyperparameter_optimizer import HyperparameterOptimizer
     from chap_core.hpo.objective import Objective
+    from chap_core.hpo.search_space import DEFAULT_HPO_TRIALS, search_space_from_config
     from chap_core.hpo.searcher import GridSearcher, RandomSearcher, Searcher, TPESearcher
-    from chap_core.hpo.types import DEFAULT_HPO_TRIALS
 
     if options.search_space is not None:
         logger.info(f"Loading hpo search space from {options.search_space}")
@@ -308,14 +362,12 @@ def get_hpo_estimator(
     if not search_space_raw or not isinstance(search_space_raw, dict):
         raise ValueError(
             "HPO search space YAML must define a non-empty mapping of parameters, either "
-            "through --estimator-options.search-space-yaml or the model's "
+            "through --estimator-options.search-space or the model's "
             "MLProject hpo_search_space."
         )
 
-    search_space = load_search_space_from_config(search_space_raw)
+    search_space = search_space_from_config(search_space_raw)
 
-    # to avoid retraining during validation even when outer n_retrain>1
-    # validation_backtest_params = backtest_params.model_copy(update={"n_retrain": 1})
     objective = Objective(model_template=template, backtest_params=backtest_params, metric=options.metric)
 
     searcher_type = options.searcher or SearcherType.TPE
@@ -332,10 +384,10 @@ def get_hpo_estimator(
     else:
         raise ValueError(f"Unknown searcher: {searcher_type!r}")
 
-    return HpoModel(
+    return HyperparameterOptimizer(
         objective=objective,
         searcher=searcher,
-        configuration=configuration,
+        model_configuration=configuration,
         search_space=search_space,
         max_trials=options.max_trials if options.max_trials is not None else default_max_trials,
         seed=options.seed,

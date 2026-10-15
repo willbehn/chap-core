@@ -34,6 +34,8 @@ class MAPEMetric(DeterministicMetric):
         aggregation_op=AggregationOp.MEAN,
         description="Mean Absolute Percentage Error - average absolute error as percent of observed",
         optimization_direction=OptimizationDirection.MINIMIZE,
+        unit="%",
+        comparison_op="skill_ratio",
     )
 
     def compute_point_metric(self, forecast: float, observed: float) -> float:
