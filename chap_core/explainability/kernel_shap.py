@@ -54,7 +54,7 @@ def _explain_shap(
         raise ValueError("groups and player_names must be passed togheter")
 
     if groups is None:
-        features_to_groups, player_names = list(range(len(feature_map))), feature_names
+        groups, player_names = list(range(len(feature_map))), feature_names
 
     features_to_groups = np.asarray(groups)
 
@@ -104,6 +104,14 @@ def _explain_shap(
     explainer = shap.KernelExplainer(value_fn, background)
     shap_values = explainer.shap_values(instance, nsamples=num_perturbations, l1_reg=False)
 
+    # All players off
+    base = explainer.expected_value
+
+    # True prediction, all players have their true value
+    fx = float(explainer.fx[0])
+    
+    logger.info(f"f(x)={fx:.4f}  base={base:.4f}  sum(SHAP)={np.sum(shap_values):.4f}  f(x)-base={fx - base:.4f}")
+
     results = sorted(zip(player_names, np.asarray(shap_values).ravel().tolist(), strict=True), key=lambda item: item[0])
     return results
 
@@ -131,7 +139,7 @@ def explain(
     if scope_explanation:
         if prune_threshold is None:
             raise ValueError("prune_threshold must be set when scope_explanation is True")
-        
+
         split_index = find_temporal_prune_depth(
             model=model,
             dataset=dataset,
@@ -168,7 +176,7 @@ def explain(
 
     result = _explain_shap(
         model=model,
-        dataset=dataset,
+        dataset=inputs.dataset,
         location=location,
         horizon=horizon,
         num_perturbations=num_perturbations,
@@ -183,7 +191,7 @@ def explain(
 
     return result
 
-# Helper function that removes static features from feature_map. This will result in the static features allways have 
+# Helper function that removes static features from feature_map. This will result in the static features allways have
 # their actual value when running predict for when both groups are on.
 # TODO not sure if I should drop it yet or not
 def drop_static_features(
@@ -219,7 +227,7 @@ def find_temporal_prune_depth(
     start: float,
     threshold: float,
 ) -> tuple[int, list[float]]: #TODO change return value later after testing
-    
+
     max_depth = len(dataset.period_range)
     print(f"Starting temporal pruning, max depth={max_depth}")
 

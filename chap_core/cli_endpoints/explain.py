@@ -179,7 +179,67 @@ def explain_lime(
                 for key, value in metrics.items():
                     logger.info(f"  {key:>15} = {value:+.4f}")
 
+# TODO Very temporary endpoint, just for testing
+def explain(
+    model_name: ModelNameArg,
+    dataset_csv: DatasetCsvArg,
+    location: list[str] | None = None,
+    all_locations: bool = False,
+    horizon: int = 3,
+    num_perturbations: int = 150,
+    seed: int | None = None,
+    last_n: int = 12,
+    granularity: int = 1,
+    run_config: RunConfigArg = RunConfig(),
+):
+    from chap_core.explainability.kernel_shap import explain
+    from chap_core.log_config import initialize_logging
+    from chap_core.models.model_template import ModelTemplate
+
+    sampler_name = "global_mean"
+
+    logger.info(f"SHAPSHAPSHAPSHAP\n Explaining model {model_name} using SHAP with background {sampler_name}")
+
+    initialize_logging(run_config.debug, run_config.log_file)
+
+    csv_path, url_geojson_path = resolve_csv_path(dataset_csv)
+    geojson_path = url_geojson_path or discover_geojson(csv_path)
+    dataset = load_dataset_from_csv(csv_path, geojson_path)
+
+    locations = _resolve_locations(location, all_locations, list(dataset.locations()))
+
+
+    template = ModelTemplate.from_directory_or_github_url(
+        model_name,
+        ignore_env=run_config.ignore_environment,
+        run_dir_type="use_existing",
+        is_chapkit_model=run_config.is_chapkit_model,
+        as_chapkit=run_config.as_chapkit,
+    )
+
+    with template:
+        estimator = template.get_model()()
+
+        for loc in locations:
+            logger.info(f"Generating SHAP explanation for {loc}, {horizon} time steps into the future")
+
+            results = explain(
+                model=estimator,
+                dataset=dataset,
+                location=loc,
+                horizon=horizon,
+                num_perturbations=num_perturbations,
+                sampler_name = sampler_name,
+                seed=seed,
+                last_n=last_n,
+                granularity=granularity,
+            )
+
+            for name, value in results:
+                logger.info(f"  {name:>15} = {value:+.4f}")
+
 
 def register_commands(app):
     """Register evaluate commands with the CLI app."""
     app.command()(explain_lime)
+    app.command()(explain)
