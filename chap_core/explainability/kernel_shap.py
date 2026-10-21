@@ -1,5 +1,6 @@
 import logging
 import time
+from pathlib import Path
 
 import numpy as np
 import shap
@@ -12,6 +13,7 @@ from chap_core.explainability.lime import (
     prepare_explain_inputs,
 )
 from chap_core.explainability.segment import SplitSegmentation
+from chap_core.explainability.temp_save_and_plotting import plot_shap_values, save_shap_explanation
 from chap_core.models.external_model import ExternalModel
 from chap_core.spatio_temporal_data.temporal_dataclass import DataSet
 
@@ -41,7 +43,7 @@ def _explain_shap(
     feature_map: list[tuple[str, str, int | None]],
     groups: list[int] | None = None,
     player_names: list[str] | None = None,
-) -> list[tuple[str, float]]:
+) -> tuple[list[tuple[str, float]], float, float]:
 
     # print(f"inputs AFTER prepare_explain_inputs:\n{inputs}\n")
     feature_names = [name for name, _, _ in feature_map]
@@ -105,15 +107,15 @@ def _explain_shap(
     shap_values = explainer.shap_values(instance, nsamples=num_perturbations, l1_reg=False)
 
     # All players off
-    base = explainer.expected_value
+    baseline_prediction = float(explainer.expected_value)
 
-    # True prediction, all players have their true value
-    fx = float(explainer.fx[0])
-    
-    logger.info(f"f(x)={fx:.4f}  base={base:.4f}  sum(SHAP)={np.sum(shap_values):.4f}  f(x)-base={fx - base:.4f}")
+    # Prediction, all players have their real value
+    prediction = float(explainer.fx[0])
+
+    logger.info(f"prediction={prediction:.4f}  baseline={baseline_prediction:.4f}  sum(SHAP)={np.sum(shap_values):.4f}  prediction-baseline={prediction - baseline_prediction:.4f}")
 
     results = sorted(zip(player_names, np.asarray(shap_values).ravel().tolist(), strict=True), key=lambda item: item[0])
-    return results
+    return results, prediction, baseline_prediction
 
 
 def explain(
@@ -130,13 +132,16 @@ def explain(
     timed: bool = False,
     scope_explanation: bool = False,
     prune_threshold: float | None = None,
+    save: bool = False,
+    plot: bool = False,
 ) -> list[tuple[str, float]]:
 
     start = time.perf_counter()
     if timed:
         logger.info("Started SHAP pipeline")
 
-    if scope_explanation:
+    #TODO will currently crash when true, will fix later
+    if scope_explanation and False:
         if prune_threshold is None:
             raise ValueError("prune_threshold must be set when scope_explanation is True")
 
@@ -174,7 +179,7 @@ def explain(
     # TODO refactor prepare_explain_inputs to prepare_data() -> segment_data()
     feature_map = build_feature_map(inputs.x0)
 
-    result = _explain_shap(
+    result, prediction, baseline_prediction = _explain_shap(
         model=model,
         dataset=inputs.dataset,
         location=location,
@@ -189,7 +194,35 @@ def explain(
     if timed:
         logger.info(f"SHAP pipeline done, used {end - start}")
 
+    # Pattern for saving/plotting is from the LIME implementation 
+    # TODO come back to later
+    saved_dir: Path | None = None
+    if save:
+        md_path = save_shap_explanation(
+            results=result,
+            model_name=model.name,
+            location=location,
+            horizon=horizon,
+            prediction=prediction,
+            baseline_prediction=baseline_prediction,
+            params={
+                "segmenter": segmenter_name,
+                "sampler": sampler_name,
+                "granularity": granularity,
+                "num_perturbations": num_perturbations,
+                "last_n": last_n,
+                "seed": seed,
+            },
+            include_plot=plot,
+        )
+        saved_dir = md_path.parent
+
+    if plot:
+        plot_path = saved_dir / "importance_plot.png" if saved_dir is not None else None
+        plot_shap_values(result, inputs.hist_df, inputs.future_df, inputs.feat_indices, save_path=plot_path)
+
     return result
+
 
 # Helper function that removes static features from feature_map. This will result in the static features allways have
 # their actual value when running predict for when both groups are on.
@@ -263,7 +296,7 @@ def find_temporal_prune_depth(
 
         groups = group_two_player_split(feature_map=feature_map_no_static)
 
-        result = _explain_shap(
+        result, _, _ = _explain_shap(
             model=model,
             dataset=dataset,
             location=location,

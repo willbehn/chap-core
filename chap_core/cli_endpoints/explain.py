@@ -233,6 +233,8 @@ def explain(
                 seed=seed,
                 last_n=last_n,
                 granularity=granularity,
+                save=True,
+                plot=True,
             )
 
             for name, value in results:

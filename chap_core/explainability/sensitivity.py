@@ -22,7 +22,7 @@ mean av tidligere år, maks a tidligere år, min av tidligere år osv.
 """
 
 def sensitivity_analysis(
-        model: ExternalModel, 
+        model: ExternalModel,
         dataset: DataSet,
         num_unused_periods: int,
         prediction_length: int = 3,
