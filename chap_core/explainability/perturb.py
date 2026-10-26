@@ -29,7 +29,7 @@ from scipy.signal import ShortTimeFFT, get_window
 
 logger = logging.getLogger(__name__)
 
-
+#TODO: I am condering refactoring all sampler to be being subclass of SampleModel (after changing to ABC)
 class SampleModel(Protocol):
     """Contract for a perturbation sampler: produce replacement values for one "off" segment.
 
@@ -148,6 +148,9 @@ class GlobalMean:
             return [0.0] * length
         return [float(np.nanmean(series))] * length
 
+    def sample_future(self, hist_df: pd.DataFrame, fut_df: pd.DataFrame, feature_name: str, step: int) -> float:
+        return float(self.sample(hist_df, (0, len(hist_df)), feature_name, 1)[0])
+
 
 class RandomUniform:
     """Replace each value in the segment with an independent uniform draw from the feature's range.
@@ -217,6 +220,8 @@ class RandomBackground:
         logger.info("Background sampling failed; fallback to constant value")
         return [0.0] * length
 
+    def sample_future(self, hist_df: pd.DataFrame, fut_df: pd.DataFrame, feature_name: str, step: int) -> float:
+        return float(self.sample(hist_df, (0, 1), feature_name, 1)[0])
 
 class FourierReplacement:
     """Replace the segment with a frequency-filtered ("background") version of the series.
@@ -316,3 +321,26 @@ class FourierReplacement:
             logger.warning(f"Original segment for {feature_name} is also invalid; using zeros")
             segment = np.zeros(length, dtype=float)
         return segment.tolist()
+
+class ClimatologyMonthly:
+    """TODO not done
+    First iteration of a sampler that uses climatology as background.
+    Not very robust, need to fix
+    """
+
+    def __init__(self, dataset: pd.DataFrame):
+        df = dataset.copy()
+        df["month"] = [p.month for p in df["time_period"]]
+        self.table = df.groupby(["location", "month"]).mean(numeric_only=True)
+
+    def sample(self, hist_df: pd.DataFrame, indices: tuple[int, int], feature_name: str, length: int):
+        start, end = indices
+        location = hist_df["location"].iloc[0]
+        periods = hist_df["time_period"].iloc[start:end]
+
+        return [float(self.table.loc[(location, p.month), feature_name]) for p in periods]
+
+    def sample_future(self, hist_df: pd.DataFrame, fut_df: pd.DataFrame, feature_name: str, step: int) -> float:
+        location = hist_df["location"].iloc[0]
+        month = fut_df["time_period"].iloc[step].month
+        return float(self.table.loc[(location, month), feature_name])

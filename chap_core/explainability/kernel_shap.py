@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Some of the samplers for lime might not work as intended for shap, will update
 # with more samplers
 def _check_allowed_sampler(sampler_name: str):
-    allowed_samplers = {"global_mean", "background", "fourier"}  # TODO expand with other samplers later
+    allowed_samplers = {"global_mean", "background", "fourier", "climatology_monthly"}  # TODO expand with other samplers later
 
     if sampler_name not in allowed_samplers:
         raise ValueError("Sampler not supported")
@@ -73,7 +73,8 @@ def _explain_shap(
             inputs.sampler,
             feature_map,
             masks,
-            inputs.global_means
+            inputs.global_means,
+            inputs.future_df,
         )
 
         # TODO currently explains the mean, and last timestep, todo for later
@@ -177,7 +178,8 @@ def explain(
     )
 
     # TODO refactor prepare_explain_inputs to prepare_data() -> segment_data()
-    feature_map = build_feature_map(inputs.x0)
+    # Static features (e.g. population) are not players and keep their actual value in every coalition
+    feature_map = drop_static_features(build_feature_map(inputs.x0))
 
     result, prediction, baseline_prediction = _explain_shap(
         model=model,
@@ -194,7 +196,7 @@ def explain(
     if timed:
         logger.info(f"SHAP pipeline done, used {end - start}")
 
-    # Pattern for saving/plotting is from the LIME implementation 
+    # Pattern for saving/plotting is from the LIME implementation
     # TODO come back to later
     saved_dir: Path | None = None
     if save:

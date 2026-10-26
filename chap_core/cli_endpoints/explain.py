@@ -186,9 +186,9 @@ def explain(
     location: list[str] | None = None,
     all_locations: bool = False,
     horizon: int = 3,
-    num_perturbations: int = 150,
+    num_perturbations: int = 300,
     seed: int | None = None,
-    last_n: int = 12,
+    last_n: int = 24,
     granularity: int = 1,
     run_config: RunConfigArg = RunConfig(),
 ):
@@ -196,7 +196,7 @@ def explain(
     from chap_core.log_config import initialize_logging
     from chap_core.models.model_template import ModelTemplate
 
-    sampler_name = "global_mean"
+    sampler_name = "background"
 
     logger.info(f"SHAPSHAPSHAPSHAP\n Explaining model {model_name} using SHAP with background {sampler_name}")
 

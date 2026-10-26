@@ -45,6 +45,7 @@ from chap_core.climate_predictor import get_climate_predictor
 from chap_core.exceptions import ModelFailedException
 from chap_core.explainability.distance import DTW, Pairwise
 from chap_core.explainability.perturb import (
+    ClimatologyMonthly,
     ConstantTransform,
     FourierReplacement,
     GlobalMean,
@@ -231,6 +232,7 @@ def perturb_vectors(
     feature_map: list[tuple[str, str, int | None]],
     flat_masks: list[np.ndarray],
     global_means: dict[str, float] | None = None,
+    fut_df: pd.DataFrame | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Perturb original vector to get local variations
@@ -245,6 +247,7 @@ def perturb_vectors(
         global_means (dict | None): Global mean per feature across all locations,
             used as the replacement value for static features when perturbed.
             If None (single-location dataset), static features fall back to 0.0.
+        fut_df : TODO burde forklare
 
     Return:
         List of perturbed vectors and list of masks
@@ -264,6 +267,9 @@ def perturb_vectors(
                 orig_val = orig_vector[parent_key]
                 if is_present == 1:
                     pb[parent_key] = float(orig_val)
+                elif "_fut_" in parent_key and fut_df is not None and hasattr(sampler, "sample_future"): #TODO, consider if I can do this cleaner
+                    base_name, step = parent_key.split("_fut_", 1)
+                    pb[parent_key] = float(sampler.sample_future(hist_df, fut_df, base_name, int(step) - 1))
                 else:
                     # Use global mean across all locations as the turned off feature,
                     # or 0.0 when the full dataset contains only one location. TODO 0.0 could be meaningless OOD
@@ -825,6 +831,10 @@ def disambiguate_sampler(name: str, rng: random.Random, dataset: pd.DataFrame | 
             return RandomUniform(rng=rng, dataset=dataset)
         case "fourier":
             return FourierReplacement(rng, dataset, window_size=None, freq=1.0)
+        case "climatology_monthly":
+            if dataset is None:
+                raise ValueError("Selected sampler needs dataset, which has been set to None")
+            return ClimatologyMonthly(dataset=dataset)
         case _:
             raise ValueError(f"Unknown sampler: {name}")
 
@@ -1132,7 +1142,7 @@ def explain(
         dataset=dataset,
         location=location,
         horizon=horizon,
-        segmenter_name=segmenter_name,
+        segmenter=segmenter_name,
         granularity=granularity,
         sampler_name=sampler_name,
         seed=seed,
@@ -1419,7 +1429,7 @@ def explain_adaptive(
         dataset=dataset,
         location=location,
         horizon=horizon,
-        segmenter_name=segmenter_name,
+        segmenter=segmenter_name,
         granularity=granularity,
         sampler_name=sampler_name,
         seed=seed,
