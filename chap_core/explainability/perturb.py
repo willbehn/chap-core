@@ -326,21 +326,49 @@ class ClimatologyMonthly:
     """TODO not done
     First iteration of a sampler that uses climatology as background.
     Not very robust, need to fix
+    Also needs to decide on what should be the minimum number of samples for one month 
+    in the warn_if_few_samples
     """
+
+    min_baseline_samples = 3
 
     def __init__(self, dataset: pd.DataFrame):
         df = dataset.copy()
         df["month"] = [p.month for p in df["time_period"]]
-        self.table = df.groupby(["location", "month"]).mean(numeric_only=True)
+        grouped = df.groupby(["location", "month"])
+        self.table = grouped.mean(numeric_only=True)
+        self.counts = grouped.count()
+
+        #TODO might not need if not part of report
+        self.warned: set[tuple[str, int, str]] = set()
 
     def sample(self, hist_df: pd.DataFrame, indices: tuple[int, int], feature_name: str, length: int):
         start, end = indices
         location = hist_df["location"].iloc[0]
         periods = hist_df["time_period"].iloc[start:end]
 
+        for p in periods:
+            self._warn_if_few_samples(location, p.month, feature_name)
+
         return [float(self.table.loc[(location, p.month), feature_name]) for p in periods]
 
     def sample_future(self, hist_df: pd.DataFrame, fut_df: pd.DataFrame, feature_name: str, step: int) -> float:
         location = hist_df["location"].iloc[0]
         month = fut_df["time_period"].iloc[step].month
+        
+        self._warn_if_few_samples(location, month, feature_name)
+
         return float(self.table.loc[(location, month), feature_name])
+
+    def _warn_if_few_samples(self, location: str, month: int, feature_name: str):
+        n = int(self.counts.loc[(location, month), feature_name])
+
+        key = (location, month, feature_name)
+
+        if n < self.min_baseline_samples and key not in self.warned:
+            self.warned.add(key)
+
+            logger.warning(
+                f"Less than {self.min_baseline_samples} samples was used for the baseline "
+                f"({feature_name}, location {location}, month {month}: {n} sample(s))"
+            )
