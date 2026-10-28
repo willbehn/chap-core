@@ -1,21 +1,19 @@
-import json
-import logging
-import time
 import uuid
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from chap_core.rest_api.app import app
+from chap_core.rest_api import celery_tasks
 from chap_core.rest_api.celery_tasks import JOB_ERROR_MAX_CHARS, JobDescription, JobType, TrackedTask
+from chap_core.rest_api.job_registry import job_function, job_name_for
 from chap_core.rest_api.v1 import jobs
 from chap_core.util import redis_available
 
-logger = logging.getLogger(__name__)
 client = TestClient(app)
 base_path = "/v1/jobs"
-evaluate_path = "/v1/evaluate"
 
 
 class _StaticWorker:
@@ -74,42 +72,38 @@ def test_failed_job_lists_why_it_failed(request_store):
     assert job["result"] is None
 
 
+def test_get_job_matches_list_entry(request_store):
+    _fail_job("job-1", RuntimeError("Prediction job ended with status 'failed'"))
+
+    response = client.get(f"{base_path}/job-1")
+
+    assert response.status_code == 200, response.json()
+    assert response.json() == client.get(f"{base_path}?ids=job-1").json()[0]
+    assert response.json()["status"] == "FAILURE"
+
+
+@job_function
+def _add(x, y):
+    return x + y
+
+
+def test_listed_job_times_carry_a_utc_offset(request_store, monkeypatch, tmp_path):
+    monkeypatch.setattr(celery_tasks, "CHAP_LOGS_DIR", tmp_path)
+    monkeypatch.setitem(celery_tasks.app.conf, "task_always_eager", True)
+    job_id = celery_tasks.celery_run.apply_async(args=(job_name_for(_add), 1, 2)).id
+
+    [job] = client.get(f"{base_path}?ids={job_id}").json()
+
+    for key in ("start_time", "end_time"):
+        assert datetime.fromisoformat(job[key]).utcoffset() == timedelta(0)
+
+
 def test_failed_job_error_is_bounded(request_store):
     _fail_job("job-1", RuntimeError("x" * (JOB_ERROR_MAX_CHARS + 500)))
 
     [job] = client.get(f"{base_path}?ids=job-1").json()
 
     assert len(job["error"]) == JOB_ERROR_MAX_CHARS
-
-
-@pytest.mark.skip(reason="Old API")
-@pytest.mark.skipif(not redis_available(), reason="Redis not available")
-@pytest.mark.celery(
-    broker="redis://localhost:6379", backend="redis://localhost:6379", include=["chap_core.rest_api.celery_tasks"]
-)
-def test_predict(big_request_json, celery_session_worker, dependency_overrides):
-    data = json.loads(big_request_json)
-    data["estimator_id"] = "naive_model"
-    # with unittest.mock.patch("chap_core.rest_api.worker_functions.Era5LandGoogleEarthEngine", gee_mock):
-    response = client.post(evaluate_path, json=data)
-    assert response.status_code == 200, response.json()
-    # response = client.post(evaluate_path, json=data)
-    print(response.json())
-    task_id = response.json()["task_id"]
-
-    for _ in range(200):
-        status = client.get(f"{base_path}/{task_id}")
-        assert status.status_code == 200, status.json()
-        if status.json() not in ["PENDING", "STARTED"]:
-            break
-        logger.info(status.json())
-        time.sleep(1)
-
-    assert status.status_code == 200, status.json()
-    assert status.json() == "SUCCESS"
-    result = client.get(f"{base_path}/{task_id}/evaluation_result")
-    assert result.status_code == 200, result.json()
-    print(result.json())
 
 
 # Job-id membership: routes that took a job_id used to either silently accept a
@@ -186,6 +180,13 @@ def test_evaluation_result_returns_backtest(monkeypatch, override_session):
     assert body["modelId"] == "naive_model"
     assert body["name"] == "test backtest"
     assert body["aggregateMetrics"] == {"MAE": 1.5}
+
+
+def test_prediction_result_created_carries_a_utc_offset(monkeypatch, override_session):
+    job_id = _stub_successful_job(monkeypatch, result=1)
+    response = client.get(f"{base_path}/{job_id}/prediction_result")
+    assert response.status_code == 200, response.text
+    assert datetime.fromisoformat(response.json()["created"]).utcoffset() == timedelta(0)
 
 
 def test_prediction_result_missing_row_returns_404(monkeypatch, override_session):

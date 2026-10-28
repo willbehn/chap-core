@@ -5,10 +5,12 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import select
 
+from chap_core.assessment.metrics import get_comparison_description
+from chap_core.database.base_tables import utc_now
 from chap_core.database.database import SessionWrapper
 from chap_core.database.dataset_tables import DataSet
-from chap_core.database.model_templates_and_config_tables import ModelConfiguration
-from chap_core.database.tables import Backtest, SpecificationBaseline, SpecificationBaselineStatus
+from chap_core.database.model_templates_and_config_tables import ModelConfiguration, ModelTemplateRole
+from chap_core.database.tables import Backtest, Prediction, SpecificationBaseline, SpecificationBaselineStatus
 from chap_core.models.builtin import BaselineNotApplicable, builtin_template_config, get_builtin_model
 from chap_core.rest_api.app import app
 from chap_core.rest_api.baseline_runs import STALE_CLAIM_AFTER, request_baselines, run_baseline
@@ -115,7 +117,7 @@ def test_a_baseline_failing_for_another_reason_fails_its_job_and_is_retried_a_da
         # A failure that repeats must not queue a job on every trigger.
         assert request_baselines(session, specification_id, "db-url") == []
         row = session.session.get(SpecificationBaseline, failed.id)
-        row.claimed_at = datetime.datetime.now() - STALE_CLAIM_AFTER - datetime.timedelta(minutes=1)
+        row.claimed_at = utc_now() - STALE_CLAIM_AFTER - datetime.timedelta(minutes=1)
         session.session.commit()
         assert request_baselines(session, specification_id, "db-url") == [failed.id]
         assert session.session.get(SpecificationBaseline, failed.id).status == SpecificationBaselineStatus.pending
@@ -125,7 +127,7 @@ def test_a_baseline_still_pending_after_a_day_is_queued_again(p_seeded_engine, s
     with SessionWrapper(p_seeded_engine) as session:
         first = request_baselines(session, specification_id, "db-url")
         lost = session.session.get(SpecificationBaseline, first[0])
-        lost.claimed_at = datetime.datetime.now() - STALE_CLAIM_AFTER - datetime.timedelta(minutes=1)
+        lost.claimed_at = utc_now() - STALE_CLAIM_AFTER - datetime.timedelta(minutes=1)
         session.session.commit()
 
         assert request_baselines(session, specification_id, "db-url") == [lost.id]
@@ -194,8 +196,156 @@ def test_a_backtest_from_the_api_runs_even_when_requesting_baselines_fails(p_see
         assert session.session.get(Backtest, backtest_id).forecasts
 
 
+def test_deleting_a_dataset_whose_only_backtests_are_baselines_is_refused_with_their_ids(
+    override_session, p_seeded_engine, baseline_worker
+):
+    with SessionWrapper(p_seeded_engine) as session:
+        dataset_id = session.session.exec(select(DataSet.id)).first()
+        backtest_id = run_backtest(
+            BacktestCreate(name="model", dataset_id=dataset_id, model_id="naive_model"),
+            session=session,
+            baseline_database_url="db-url",
+            **PARAMS,
+        )
+    _run_queued(p_seeded_engine, baseline_worker)
+    assert client.delete(f"/v1/crud/backtests/{backtest_id}").status_code == 200
+    with SessionWrapper(p_seeded_engine) as session:
+        # Clear the seeded backtests and predictions so only the hidden baselines are left.
+        for row in [
+            *session.session.exec(select(Backtest).where(Backtest.name != "baseline")).all(),
+            *session.session.exec(select(Prediction)).all(),
+        ]:
+            session.session.delete(row)
+        session.session.commit()
+        baseline_ids = sorted(session.session.exec(select(Backtest.id).where(Backtest.dataset_id == dataset_id)).all())
+    assert len(baseline_ids) == 3
+    assert [b["id"] for b in client.get("/v1/crud/backtests").json()] == []
+
+    response = client.delete(f"/v1/crud/datasets/{dataset_id}")
+
+    assert response.status_code == 409
+    assert f"backtests {baseline_ids}" in response.json()["detail"]
+
+
 def test_reading_a_specification_queues_its_missing_baselines(override_session, specification_id, baseline_worker):
     assert client.get(f"/v1/crud/backtest-specifications/{specification_id}").status_code == 200
     assert len(baseline_worker.queued) == 3
     assert client.get(f"/v1/crud/backtest-specifications/{specification_id}").status_code == 200
     assert len(baseline_worker.queued) == 3
+
+
+def _leaderboard(specification_id, **params):
+    response = client.get(f"/v1/crud/backtest-specifications/{specification_id}", params=params)
+    assert response.status_code == 200
+    return response.json()
+
+
+def test_the_leaderboard_lists_baselines_as_pending_until_they_have_run(
+    override_session, specification_id, baseline_worker
+):
+    leaderboard = _leaderboard(specification_id)
+
+    assert {b["configuredModel"]["name"]: b["status"] for b in leaderboard["baselines"]} == {
+        "global_median": "pending",
+        "seasonal_median": "pending",
+        "persistence": "pending",
+    }
+    assert leaderboard["comparisonModels"] is None
+    assert all(backtest["comparisons"] == [] for backtest in leaderboard["backtests"])
+    metrics = {metric["id"]: metric for metric in leaderboard["metrics"]}
+    assert (metrics["mae"]["comparisonOp"], metrics["mae"]["comparisonDescription"]) == (
+        "skill_ratio",
+        get_comparison_description("skill_ratio"),
+    )
+
+
+def test_the_leaderboard_compares_each_backtest_with_the_baselines(
+    override_session, p_seeded_engine, specification_id, baseline_worker, monkeypatch
+):
+    def fail(*args, **kwargs):
+        raise BaselineNotApplicable("too little history")
+
+    monkeypatch.setattr(get_builtin_model("persistence"), "predict", fail)
+    with SessionWrapper(p_seeded_engine) as session:
+        request_baselines(session, specification_id, "db-url")
+    _run_queued(p_seeded_engine, baseline_worker)
+    # The seeded dataset is too small to score, so the scores are set here.
+    with SessionWrapper(p_seeded_engine) as session:
+        for row in _rows(p_seeded_engine, specification_id).values():
+            if row.backtest_id is not None:
+                session.session.get(Backtest, row.backtest_id).aggregate_metrics = {"mae": 4.0}
+        model_backtest = session.session.exec(
+            select(Backtest).where(Backtest.specification_id == specification_id, Backtest.model_id == "naive_model")
+        ).first()
+        model_backtest.aggregate_metrics = {"mae": 3.0}
+        session.session.commit()
+        model_backtest_id = model_backtest.id
+
+    leaderboard = _leaderboard(specification_id)
+    baselines = {b["configuredModel"]["name"]: b for b in leaderboard["baselines"]}
+    assert (baselines["persistence"]["status"], baselines["persistence"]["message"]) == (
+        "not_applicable",
+        "too little history",
+    )
+    assert baselines["persistence"]["aggregateMetrics"] == {}
+    done_ids = {b["configuredModel"]["id"] for b in baselines.values() if b["status"] == "done"}
+    assert len(done_ids) == 2
+    backtest = next(b for b in leaderboard["backtests"] if b["id"] == model_backtest_id)
+    assert {c["configuredModelId"]: c["values"] for c in backtest["comparisons"]} == {
+        model_id: {"mae": pytest.approx(0.25)} for model_id in done_ids
+    }
+
+
+def test_the_leaderboard_lists_comparison_models_on_request(override_session, p_seeded_engine, specification_id):
+    with SessionWrapper(p_seeded_engine) as session:
+        dataset_id = session.session.exec(select(DataSet.id)).first()
+        newest_id = run_backtest(
+            BacktestCreate(name="again", dataset_id=dataset_id, model_id="naive_model"), session=session, **PARAMS
+        )
+        newest = session.session.get(Backtest, newest_id)
+        newest.configured_model.model_template.role = ModelTemplateRole.comparison
+        session.session.commit()
+
+    assert _leaderboard(specification_id)["comparisonModels"] is None
+    leaderboard = _leaderboard(specification_id, includeComparisonModels=True)
+    (comparison_model,) = leaderboard["comparisonModels"]
+    assert (comparison_model["status"], comparison_model["backtestId"]) == ("done", newest_id)
+    comparison_model_id = comparison_model["configuredModel"]["id"]
+    # A backtest is never compared with a run of its own model, including an older one.
+    own_runs = [b for b in leaderboard["backtests"] if b["configuredModel"]["id"] == comparison_model_id]
+    others = [b for b in leaderboard["backtests"] if b["configuredModel"]["id"] != comparison_model_id]
+    assert len(own_runs) == 2 and others
+    assert all(b["comparisons"] == [] for b in own_runs)
+    assert all([c["configuredModelId"] for c in b["comparisons"]] == [comparison_model_id] for b in others)
+
+
+def test_the_leaderboard_leaves_out_archived_comparison_models(override_session, p_seeded_engine, specification_id):
+    with SessionWrapper(p_seeded_engine) as session:
+        backtest = session.session.exec(select(Backtest).where(Backtest.specification_id == specification_id)).first()
+        backtest.configured_model.model_template.role = ModelTemplateRole.comparison
+        backtest.configured_model.archived = True
+        session.session.commit()
+
+    assert _leaderboard(specification_id, includeComparisonModels=True)["comparisonModels"] == []
+
+
+def test_the_leaderboard_leaves_out_backtests_of_archived_models(override_session, p_seeded_engine, specification_id):
+    with SessionWrapper(p_seeded_engine) as session:
+        backtest = session.session.exec(select(Backtest).where(Backtest.specification_id == specification_id)).first()
+        backtest.configured_model.archived = True
+        session.session.commit()
+        archived = set(
+            session.session.exec(
+                select(Backtest.id).where(
+                    Backtest.specification_id == specification_id, Backtest.model_db_id == backtest.model_db_id
+                )
+            ).all()
+        )
+
+    leaderboard = _leaderboard(specification_id)
+    assert not archived & {b["id"] for b in leaderboard["backtests"]}
+    (row,) = [s for s in client.get("/v1/crud/backtest-specifications").json() if s["id"] == specification_id]
+    assert row["backtestCount"] == len(leaderboard["backtests"])
+    # On request, and in the backtest listing, they are still shown.
+    assert archived <= {b["id"] for b in _leaderboard(specification_id, includeArchivedModels=True)["backtests"]}
+    assert archived <= {b["id"] for b in client.get("/v1/crud/backtests").json()}

@@ -21,6 +21,7 @@ from chap_core.assessment.dataset_splitting import train_test_generator
 from chap_core.database.dataset_tables import ObservationBase
 from chap_core.datatypes import FullData, HealthPopulationData, SimpleClimateData
 from chap_core.geometry import Polygons
+from chap_core.rest_api import celery_tasks
 from chap_core.rest_api.data_models import DatasetCreate, FetchRequest, MakePredictionRequest
 from chap_core.rest_api.worker_functions import WorkerConfig
 
@@ -31,6 +32,12 @@ IS_WINDOWS = os.name == "nt"
 
 # logger
 logger = logging.getLogger(__name__)
+
+# Each xdist process runs its own in-process Celery worker against its own database, so it
+# gets its own queue too. Otherwise one process's worker could pick up another's job and run
+# it against the wrong database. Set before the first send, when Celery builds its queues.
+CELERY_TEST_QUEUE = f"celery-{os.environ.get('PYTEST_XDIST_WORKER', 'main')}"
+celery_tasks.app.conf.task_default_queue = CELERY_TEST_QUEUE
 
 
 @pytest.fixture(scope="session")
@@ -52,9 +59,11 @@ def celery_config(database_url):
     return {
         "broker_url": f"redis://{host}:{port}",  # /0",
         "result_backend": f"redis://{host}:{port}",  # /1",
-        "task_serializer": "pickle",
-        "accept_content": ["pickle"],
-        "result_serializer": "pickle",
+        "task_serializer": "json",
+        "accept_content": ["json"],
+        "result_serializer": "json",
+        "result_accept_content": ["json"],
+        "task_default_queue": CELERY_TEST_QUEUE,
         "database_url": database_url,
     }
 
@@ -197,14 +206,6 @@ def models_path():
 
 
 @pytest.fixture
-def local_data_path():
-    path = Path("/home/knut/Data/ch_data/")
-    if not path.exists():
-        pytest.skip("Data path does not exist")
-    return path
-
-
-@pytest.fixture
 def tests_path():
     return Path(__file__).parent
 
@@ -286,36 +287,6 @@ def big_request_json(data_path):
         pytest.skip()
     with open(filepath, "r") as f:
         return f.read()
-
-
-@pytest.fixture
-def laos_request(local_data_path):
-    filepath = local_data_path / "laos_requet.json"
-    with open(filepath, "r") as f:
-        text = f.read()
-    dicts = json.loads(text)
-    dicts["estimator_id"] = "naive_model"
-    return json.dumps(dicts)
-
-
-@pytest.fixture
-def laos_request_2(local_data_path):
-    filepath = local_data_path / "laos_request_2.json"
-    with open(filepath, "r") as f:
-        text = f.read()
-    dicts = json.loads(text)
-    dicts["estimator_id"] = "naive_model"
-    return json.dumps(dicts)
-
-
-@pytest.fixture
-def laos_request_3(local_data_path):
-    filepath = local_data_path / "laos_request_3.json"
-    with open(filepath, "r") as f:
-        text = f.read()
-    dicts = json.loads(text)
-    dicts["estimator_id"] = "naive_model"
-    return json.dumps(dicts)
 
 
 @pytest.fixture
@@ -410,6 +381,22 @@ def clean_engine(database_url):
 
 
 @pytest.fixture
+def engine():
+    from sqlalchemy import event
+
+    eng = create_engine("sqlite://")
+
+    @event.listens_for(eng, "connect")
+    def _enable_fk(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    SQLModel.metadata.create_all(eng)
+    return eng
+
+
+@pytest.fixture
 def test_config():
     return WorkerConfig(is_test=True)
 
@@ -492,11 +479,13 @@ def alert_prediction():
             levels=[
                 AlertLevel(
                     name="monitor",
+                    output_code="1",
                     threshold_params=PercentileParams(type="percentile", quantile=0.5),
                     exceedance_threshold=0.5,
                 ),
                 AlertLevel(
                     name="action",
+                    output_code="2",
                     threshold_params=PercentileParams(type="percentile", quantile=1.0),
                     exceedance_threshold=0.75,
                 ),

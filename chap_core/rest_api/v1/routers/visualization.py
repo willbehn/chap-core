@@ -18,16 +18,17 @@ from chap_core.assessment.backtest_plots.db_dimensions import DBFacetDimension, 
 from chap_core.assessment.evaluation import Evaluation
 from chap_core.assessment.metric_plots import get_metric_plots_registry, list_metric_plots
 from chap_core.assessment.metrics import available_metrics
-from chap_core.assessment.metrics.base import OptimizationDirection, TargetBehavior
 from chap_core.database.base_tables import DBModel
 from chap_core.database.dataset_tables import DataSet
+from chap_core.database.settings import SettingsManager
 from chap_core.database.tables import Backtest
 from chap_core.plotting.dataset_plot import create_plot_from_dataset, get_dataset_plots_registry, list_dataset_plots
 from chap_core.plotting.evaluation_plot import (
     VisualizationInfo,
     make_plot_from_backtest_object,
 )
-from chap_core.rest_api.v1.routers.dependencies import get_session
+from chap_core.rest_api.leaderboard_models import MetricInfo, list_metric_info
+from chap_core.rest_api.v1.routers.dependencies import get_session, get_settings_manager
 
 logger = logging.getLogger(__name__)
 
@@ -57,51 +58,12 @@ class VisualizationParams(DBModel):
     metric_id: int = Field(description="Primary key of the metric to score against.")
 
 
-class MetricInfo(DBModel):
-    """Catalogue entry for one scoring metric (CRPS, MAE, ...)."""
-
-    id: str = Field(description="Canonical metric identifier used in URLs and request bodies.")
-    display_name: str = Field(description="Human-friendly metric name shown in pickers.")
-    description: str = Field(default="", description="Short paragraph explaining what the metric measures.")
-    unit: str | None = Field(default=None, description="Display suffix for the raw score, e.g. '%' for MAPE.")
-    target: float | None = Field(
-        default=None,
-        description="Ideal value in raw score units, e.g. 0.8 for 80% coverage. Null when no fixed target applies.",
-    )
-    target_behavior: TargetBehavior = Field(
-        default=TargetBehavior.CLOSEST,
-        description=(
-            "How to judge a score against ``target``, only meaningful when ``target`` is set. "
-            "'closest' means deviating in either direction is worse. 'at_least' means higher is "
-            "better up to the target and flat above it, so only scores below the target should be "
-            "flagged as bad."
-        ),
-    )
-    optimization_direction: OptimizationDirection | None = Field(
-        default=None,
-        description=(
-            "Whether a lower ('minimize') or higher ('maximize') score is better. "
-            "Null for metrics where neither direction is better; those set ``target`` instead, "
-            "and ``target_behavior`` says how to judge a score against it."
-        ),
-    )
-    comparison_op: str | None = Field(
-        default=None,
-        description=(
-            "Name of the operator used to compare a score with a baseline or comparison model's score: "
-            "'skill_ratio' (relative improvement, 1 - score / reference for error scores), 'difference' "
-            "(improvement in the metric's own units) or 'target_distance' (how much closer to ``target``). "
-            "Positive always means better than the reference. Null when the metric has no comparison."
-        ),
-    )
-
-
 @router.get(
     "/metrics/{backtest_id}",
     response_model=list[MetricInfo],
     summary="Discover which scoring metrics are available",
 )
-def get_available_metrics(backtest_id: int):
+def get_available_metrics(backtest_id: int, settings_manager: SettingsManager = Depends(get_settings_manager)):
     """List the metrics you can score a backtest with (CRPS, MAE, ...), with a human-friendly name, description, optimization direction, unit and target for each.
 
     Use this to populate a metric picker in a UI before requesting a specific plot. The
@@ -110,19 +72,7 @@ def get_available_metrics(backtest_id: int):
     """
     logger.info(f"Getting available metrics for backtest {backtest_id}")
     logger.info(f"Available metrics: {available_metrics.keys()}")
-    return [
-        MetricInfo(
-            id=metric_id,
-            display_name=metric_factory().get_name(),
-            description=metric_factory().get_description(),
-            optimization_direction=metric_factory.spec.optimization_direction,
-            target_behavior=metric_factory.spec.target_behavior,
-            unit=metric_factory.spec.unit,
-            target=metric_factory.spec.target,
-            comparison_op=metric_factory.spec.comparison_op,
-        )
-        for metric_id, metric_factory in available_metrics.items()
-    ]
+    return list_metric_info(settings_manager.get())
 
 
 @router.get(

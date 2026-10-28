@@ -10,9 +10,9 @@ from __future__ import annotations
 import datetime
 
 import pytest
-from sqlalchemy import event, inspect
+from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel
 
 from chap_core.assessment.thresholds.params import SeasonalParams
 from chap_core.database.alert_tables import Alert, AlertApproval, AlertLevel
@@ -33,20 +33,6 @@ from chap_core.services.alert_service import (
 
 
 @pytest.fixture
-def engine():
-    eng = create_engine("sqlite://")
-
-    @event.listens_for(eng, "connect")
-    def _enable_fk(dbapi_connection, _connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    SQLModel.metadata.create_all(eng)
-    return eng
-
-
-@pytest.fixture
 def policy_id(engine):
     """A two-tier policy to raise alerts against."""
     with Session(engine) as session:
@@ -56,11 +42,13 @@ def policy_id(engine):
             levels=[
                 AlertLevel(
                     name="monitor",
+                    output_code="1",
                     threshold_params=SeasonalParams(type="seasonal", std_multiplier=1.0),
                     exceedance_threshold=0.3,
                 ),
                 AlertLevel(
                     name="action",
+                    output_code="2",
                     threshold_params=SeasonalParams(type="seasonal", std_multiplier=3.0),
                     exceedance_threshold=0.8,
                 ),
