@@ -13,7 +13,11 @@ from chap_core.explainability.lime import (
     prepare_explain_inputs,
 )
 from chap_core.explainability.segment import SplitSegmentation
-from chap_core.explainability.temp_save_and_plotting import plot_shap_values, save_shap_explanation
+from chap_core.explainability.temp_save_and_plotting import (
+    plot_shap_percentages,
+    plot_shap_values,
+    save_shap_explanation,
+)
 from chap_core.models.external_model import ExternalModel
 from chap_core.spatio_temporal_data.temporal_dataclass import DataSet
 
@@ -178,7 +182,7 @@ def explain(
     )
 
     # TODO refactor prepare_explain_inputs to prepare_data() -> segment_data()
-    # Static features (e.g. population) are not players and keep their actual value in every coalition
+    # TODO reconsider if I should drop static features or not
     feature_map = drop_static_features(build_feature_map(inputs.x0))
 
     result, prediction, baseline_prediction = _explain_shap(
@@ -197,7 +201,7 @@ def explain(
         logger.info(f"SHAP pipeline done, used {end - start}")
 
     # Pattern for saving/plotting is from the LIME implementation
-    # TODO come back to later
+    # TODO refactor saving pipeline to be ttaylormade for the transparent explanantion
     saved_dir: Path | None = None
     if save:
         md_path = save_shap_explanation(
@@ -208,6 +212,7 @@ def explain(
             prediction=prediction,
             baseline_prediction=baseline_prediction,
             params={
+                "dataset": dataset.metadata.filename,
                 "segmenter": segmenter_name,
                 "sampler": sampler_name,
                 "granularity": granularity,
@@ -222,13 +227,14 @@ def explain(
     if plot:
         plot_path = saved_dir / "importance_plot.png" if saved_dir is not None else None
         plot_shap_values(result, inputs.hist_df, inputs.future_df, inputs.feat_indices, save_path=plot_path)
+        percentage_plot_path = saved_dir / "percentage_plot.png" if saved_dir is not None else None
+        plot_shap_percentages(result, save_path=percentage_plot_path)
 
     return result
 
 
 # Helper function that removes static features from feature_map. This will result in the static features allways have
 # their actual value when running predict for when both groups are on.
-# TODO not sure if I should drop it yet or not
 def drop_static_features(
     feature_map: list[tuple[str, str, int | None]]
 ) -> list[tuple[str, str, int | None]]:

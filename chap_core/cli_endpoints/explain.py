@@ -182,7 +182,7 @@ def explain(
     horizon: int = 3,
     num_perturbations: int = 300,
     seed: int | None = None,
-    last_n: int = 24,
+    last_n: int = 36,
     granularity: int = 1,
     run_config: RunConfigArg = RunConfig(),
 ):
@@ -190,7 +190,7 @@ def explain(
     from chap_core.log_config import initialize_logging
     from chap_core.models.model_template import ModelTemplate
 
-    sampler_name = "background"
+    sampler_name = "climatology_monthly"
 
     logger.info(f"SHAPSHAPSHAPSHAP\n Explaining model {model_name} using SHAP with background {sampler_name}")
 

@@ -14,7 +14,7 @@ from chap_core.util import generate_run_name
 logger = logging.getLogger(__name__)
 
 """
-This files contains codefrom the LIME equivlant code for saving and plotting the explanation result.
+This files contains code from the LIME equivlant code for saving and plotting the explanation result.
 
 This is just for testing and is work in progress.
 
@@ -83,15 +83,50 @@ def save_shap_explanation(
     if include_plot:
         lines += [
             "",
-            "## Plot",
+            "## Plots",
             "",
-            "![Feature importance](importance_plot.png)",
+            "### How much each variable influenced the prediction",
+            "![Contribution percentages](percentage_plot.png)",
+            "",
+            "### When each variable raised or lowered the prediction",
+            "![Feature importance](importance_plot.png)",            
         ]
 
     md_path = run_dir / "explanation.md"
     md_path.write_text("\n".join(lines) + "\n")
     logger.info(f"Explanation saved to {md_path}")
     return md_path
+
+
+def plot_shap_percentages(
+    coefficients: list[tuple[str, float]],
+    save_path: Path | None = None,
+):
+    temp_columns, static_columns = parse_coefficients(coefficients)
+
+    totals = {name: sum(abs(v) for v in lags.values()) for name, lags in temp_columns.items()}
+    totals.update({name: abs(value) for name, value in static_columns.items()})
+
+    total = sum(totals.values())
+
+    names = sorted(totals, key=totals.__getitem__, reverse=True)
+    percentages = [100.0 * totals[name] / total for name in names]
+
+    fig, ax = plt.subplots(figsize=(6, max(2.0, 0.5 * len(names))))
+    ax.barh(names, percentages, color="steelblue")
+    ax.invert_yaxis()
+    ax.set_xlabel("Share of total influence (%)")
+    ax.set_xlim(0, max(percentages) * 1.15)
+    for i, pct in enumerate(percentages):
+        ax.text(pct + max(percentages) * 0.02, i, f"{pct:.0f}%", va="center", fontsize=9)
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+        logger.info(f"Percentage plot saved to {save_path}")
+    else:
+        plt.show()
 
 
 def plot_shap_values(
@@ -103,8 +138,6 @@ def plot_shap_values(
 ):
     """
     Based on plot_importance in plot.py
-
-   
     """
     temp_columns, static_columns = parse_coefficients(coefficients)
 
@@ -112,7 +145,7 @@ def plot_shap_values(
     max_static = max((abs(v) for v in static_columns.values()), default=0.0)
     max_val = max(max_temp, max_static) or 1.0
 
-    cmap = plt.get_cmap("RdBu")
+    cmap = plt.get_cmap("RdBu_r")
     norm = mcolors.SymLogNorm(linthresh=max_val / 100, vmin=-max_val, vmax=max_val)
 
     def label(ax, x, value):
