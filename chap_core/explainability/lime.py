@@ -805,7 +805,9 @@ def disambiguate_segmenter(name: str, granularity: int, window_size: int | None 
             raise ValueError(f"Unknown segmenter: {name}")
 
 
-def disambiguate_sampler(name: str, rng: random.Random, dataset: pd.DataFrame | None = None) -> SampleModel:
+def disambiguate_sampler(
+    name: str, rng: random.Random, dataset: pd.DataFrame | None = None, last_n: int | None = None
+) -> SampleModel:
     """Map a sampler short name to a concrete sampler instance.
 
     Recognises ``background``, ``linear``, ``constant``, ``local_mean``,
@@ -834,7 +836,7 @@ def disambiguate_sampler(name: str, rng: random.Random, dataset: pd.DataFrame | 
         case "climatology_monthly":
             if dataset is None:
                 raise ValueError("Selected sampler needs dataset, which has been set to None")
-            return ClimatologyMonthly(dataset=dataset)
+            return ClimatologyMonthly(dataset=dataset, last_n=last_n)
         case _:
             raise ValueError(f"Unknown sampler: {name}")
 
@@ -1063,7 +1065,7 @@ def prepare_explain_inputs(
 
     full_dataset_df = dataset.to_pandas()
     rng = random.Random(seed)
-    sampler = disambiguate_sampler(sampler_name, rng, full_dataset_df)
+    sampler = disambiguate_sampler(sampler_name, rng, full_dataset_df, last_n)
 
     num_locations = len(list(dataset.locations()))
     global_means: dict[str, float] | None = (

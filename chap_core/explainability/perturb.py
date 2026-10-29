@@ -332,8 +332,17 @@ class ClimatologyMonthly:
 
     min_baseline_samples = 3
 
-    def __init__(self, dataset: pd.DataFrame):
-        df = dataset.copy()
+    def __init__(self, dataset: pd.DataFrame, last_n: int | None):
+        if last_n is None:
+            raise ValueError("ClimatologyMonthly must be used with last_n set")
+
+        # TODO mby remove, not sure if I am going to exclude the explained window or not yet
+        periods = sorted(dataset["time_period"].unique())
+        if last_n >= len(periods):
+            raise ValueError(f"last_n={last_n} covers the whole dataset, so no data for the climatology baseline")
+        
+        df = dataset[dataset["time_period"] < periods[-last_n]].copy()
+
         df["month"] = [p.month for p in df["time_period"]]
         grouped = df.groupby(["location", "month"])
         self.table = grouped.mean(numeric_only=True)
