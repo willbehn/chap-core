@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -14,8 +15,8 @@ from chap_core.explainability.lime import (
 )
 from chap_core.explainability.segment import SplitSegmentation
 from chap_core.explainability.temp_save_and_plotting import (
-    plot_shap_percentages,
     plot_shap_values,
+    plot_shap_waterfall,
     save_shap_explanation,
 )
 from chap_core.models.external_model import ExternalModel
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Some of the samplers for lime might not work as intended for shap, will update
 # with more samplers
 def _check_allowed_sampler(sampler_name: str):
-    allowed_samplers = {"global_mean", "background", "fourier", "climatology_monthly"}  # TODO expand with other samplers later
+    allowed_samplers = {"global_mean", "background", "climatology_monthly"}  # TODO expand with other samplers later
 
     if sampler_name not in allowed_samplers:
         raise ValueError("Sampler not supported")
@@ -139,6 +140,7 @@ def explain(
     prune_threshold: float | None = None,
     save: bool = False,
     plot: bool = False,
+    fast: bool = False,
 ) -> list[tuple[str, float]]:
 
     start = time.perf_counter()
@@ -185,6 +187,11 @@ def explain(
     # TODO reconsider if I should drop static features or not
     feature_map = drop_static_features(build_feature_map(inputs.x0))
 
+    groups, player_names = None, None
+    if fast:
+        groups, player_names = group_by_variable(feature_map)
+        num_perturbations = 2 ** len(player_names)
+
     result, prediction, baseline_prediction = _explain_shap(
         model=model,
         dataset=inputs.dataset,
@@ -194,6 +201,8 @@ def explain(
         seed=seed,
         inputs=inputs,
         feature_map=feature_map,
+        groups=groups,
+        player_names=player_names,
     )
 
     end = time.perf_counter()
@@ -219,16 +228,23 @@ def explain(
                 "num_perturbations": num_perturbations,
                 "last_n": last_n,
                 "seed": seed,
+                "fast": fast,
             },
             include_plot=plot,
         )
         saved_dir = md_path.parent
 
     if plot:
-        plot_path = saved_dir / "importance_plot.png" if saved_dir is not None else None
-        plot_shap_values(result, inputs.hist_df, inputs.future_df, inputs.feat_indices, save_path=plot_path)
-        percentage_plot_path = saved_dir / "percentage_plot.png" if saved_dir is not None else None
-        plot_shap_percentages(result, save_path=percentage_plot_path)
+        
+        if not fast:
+            plot_path = saved_dir / "importance_plot.png" if saved_dir is not None else None
+            
+            plot_shap_values(
+                result, inputs.hist_df, inputs.future_df, inputs.feat_indices, sampler=inputs.sampler, save_path=plot_path
+            )
+
+        waterfall_plot_path = saved_dir / "waterfall_plot.png" if saved_dir is not None else None
+        plot_shap_waterfall(result, baseline_prediction, prediction, save_path=waterfall_plot_path)
 
     return result
 
@@ -241,6 +257,16 @@ def drop_static_features(
 
     # Keeps only features that has lags or that is a future feature
     return [entry for entry in feature_map if entry[2] is not None or "_fut_" in entry[0]]
+
+
+# Helper function to group all segments and future steps of a variable into one player
+# feks rainfall_seg_0 and rainfall_fut_1 into one player rainfall
+def group_by_variable(feature_map: list[tuple[str, str, int | None]]) -> tuple[list[int], list[str]]:
+    variables = [re.sub(r"_(seg|fut)_\d+$", "", name) for name, _, _ in feature_map]
+    player_names = list(dict.fromkeys(variables))
+    groups = [player_names.index(variable) for variable in variables]
+    
+    return groups, player_names
 
 
 # Helper function to group features into the old/new player game when doing timeshap-ish pruning

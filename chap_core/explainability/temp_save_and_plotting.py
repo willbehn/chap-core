@@ -3,10 +3,12 @@ from pathlib import Path
 
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
+import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from matplotlib.gridspec import GridSpec
 
+from chap_core.explainability.perturb import SampleModel
 from chap_core.explainability.plot import parse_coefficients
 from chap_core.models.utils import CHAP_RUNS_DIR
 from chap_core.util import generate_run_name
@@ -49,6 +51,8 @@ def save_shap_explanation(
         f"**Horizon:** {horizon}  ",
         f"**Generated:** {timestamp}  ",
         "",
+    ]
+    lines += [
         "## Parameters",
         "",
         "| Parameter | Value |",
@@ -85,12 +89,16 @@ def save_shap_explanation(
             "",
             "## Plots",
             "",
-            "### How much each variable influenced the prediction",
-            "![Contribution percentages](percentage_plot.png)",
-            "",
-            "### When each variable raised or lowered the prediction",
-            "![Feature importance](importance_plot.png)",            
+            "### How each variable moved the prediction away from the baseline",
+            "![Waterfall](waterfall_plot.png)",
         ]
+        # Grouped (fast) runs have one value per variable, so there is no per-segment importance plot
+        if any("_seg_" in name or "_fut_" in name for name, _ in results):
+            lines += [
+                "",
+                "### When each variable raised or lowered the prediction",
+                "![Feature importance](importance_plot.png)",
+            ]
 
     md_path = run_dir / "explanation.md"
     md_path.write_text("\n".join(lines) + "\n")
@@ -98,33 +106,58 @@ def save_shap_explanation(
     return md_path
 
 
-def plot_shap_percentages(
+def plot_shap_waterfall(
     coefficients: list[tuple[str, float]],
+    baseline_prediction: float,
+    prediction: float,
     save_path: Path | None = None,
 ):
+    """
+    Waterfall from the baseline prediction to the prediction, with one step per variable.
+
+    The SHAP values of all segments and future steps of a variable are summed.
+    """
     temp_columns, static_columns = parse_coefficients(coefficients)
 
-    totals = {name: sum(abs(v) for v in lags.values()) for name, lags in temp_columns.items()}
-    totals.update({name: abs(value) for name, value in static_columns.items()})
+    totals = {name: sum(lags.values()) for name, lags in temp_columns.items()}
+    totals.update(static_columns)
+    names = sorted(totals, key=lambda name: abs(totals[name]), reverse=True)
 
-    total = sum(totals.values())
+    labels = ["Baseline"] + names + ["Prediction"]
+    width = 0.6
+    fig, ax = plt.subplots(figsize=(1.4 * len(labels) + 1, 4.5))
 
-    names = sorted(totals, key=totals.__getitem__, reverse=True)
-    percentages = [100.0 * totals[name] / total for name in names]
+    def label(x, top, text):
+        ax.annotate(text, (x, top), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=9)
 
-    fig, ax = plt.subplots(figsize=(6, max(2.0, 0.5 * len(names))))
-    ax.barh(names, percentages, color="steelblue")
-    ax.invert_yaxis()
-    ax.set_xlabel("Share of total influence (%)")
-    ax.set_xlim(0, max(percentages) * 1.15)
-    for i, pct in enumerate(percentages):
-        ax.text(pct + max(percentages) * 0.02, i, f"{pct:.0f}%", va="center", fontsize=9)
+    ax.bar(0, baseline_prediction, width, color="darkgray")
+    label(0, baseline_prediction, f"{baseline_prediction:.1f}")
+
+    # One colour per variable group
+    colors = plt.get_cmap("tab10")
+    level = baseline_prediction
+    for i, name in enumerate(names, start=1):
+        value = totals[name]
+        ax.plot([i - 1 + width / 2, i - width / 2], [level, level], color="gray", linewidth=0.8)
+        ax.bar(i, value, width, bottom=level, color=colors((i - 1) % colors.N))
+        label(i, max(level, level + value), f"{value:+.1f}")
+        level += value
+
+    end = len(labels) - 1
+    ax.plot([end - 1 + width / 2, end - width / 2], [level, level], color="gray", linewidth=0.8)
+    ax.bar(end, prediction, width, color="black")
+    label(end, prediction, f"{prediction:.1f}")
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("Prediction (disease cases)")
+    ax.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
 
     if save_path is not None:
         fig.savefig(save_path, dpi=150)
         plt.close(fig)
-        logger.info(f"Percentage plot saved to {save_path}")
+        logger.info(f"Waterfall plot saved to {save_path}")
     else:
         plt.show()
 
@@ -134,10 +167,13 @@ def plot_shap_values(
     hist_df: pd.DataFrame,
     fut_df: pd.DataFrame,
     segment_indices: dict[str, dict[int, tuple[int, int]]],
+    sampler: SampleModel | None = None,
     save_path: Path | None = None,
 ):
     """
     Based on plot_importance in plot.py
+
+    If sampler is given, the baseline (the values a feature is replaced with when turned off) is drawn as a red line.
     """
     temp_columns, static_columns = parse_coefficients(coefficients)
 
@@ -146,7 +182,7 @@ def plot_shap_values(
     max_val = max(max_temp, max_static) or 1.0
 
     cmap = plt.get_cmap("RdBu_r")
-    norm = mcolors.SymLogNorm(linthresh=max_val / 100, vmin=-max_val, vmax=max_val)
+    norm = mcolors.Normalize(vmin=-max_val, vmax=max_val)
 
     def label(ax, x, value):
         ax.text(x, 0.95, f"{value:+.3f}", transform=ax.get_xaxis_transform(), ha="center", va="top", fontsize=7)
@@ -170,10 +206,30 @@ def plot_shap_values(
         if col in hist_df.columns and hist_indices is not None:
             y = hist_df[col].tolist()
             ax_hist.plot(range(len(y)), y)
+            baseline = None
+            if sampler is not None:
+                baseline = [float("nan")] * len(y)
+                for startx, endx in hist_indices.values():
+                    baseline[startx:endx] = sampler.sample(hist_df, (startx, endx), col, endx - startx)
+                ax_hist.plot(range(len(y)), baseline, color="red", linewidth=1.2, alpha=0.7, label="baseline")
+                if i == 0:
+                    ax_hist.legend(fontsize=7, loc="upper left")
             for lag, (startx, endx) in hist_indices.items():
                 ax_hist.axvline(x=endx, color="darkgray", linestyle="--", linewidth=1.0)
                 value = temp_columns[col].get(lag, 0.0)
-                ax_hist.axvspan(startx, endx, facecolor=cmap(norm(value)), alpha=0.5, zorder=0)
+                if baseline is None:
+                    ax_hist.axvspan(startx, endx, facecolor=cmap(norm(value)), alpha=0.5, zorder=0)
+                else:
+                    # Fill only the gap between input and baseline; include endx so neighbouring segments touch
+                    stop = min(endx + 1, len(y))
+                    ax_hist.fill_between(
+                        range(startx, stop),
+                        y[startx:stop],
+                        baseline[startx:stop],
+                        color=cmap(norm(value)),
+                        alpha=0.7,
+                        linewidth=0,
+                    )
                 label(ax_hist, (startx + endx) / 2, value)
         else:
             ax_hist.axis("off")
@@ -185,15 +241,35 @@ def plot_shap_values(
         fut_coeffs = {abs(lag): val for lag, val in temp_columns[col].items() if lag < 0}
         if col in fut_df.columns and fut_coeffs:
             y_fut = fut_df[col].tolist()
+            baseline_fut = None
+            if sampler is not None and hasattr(sampler, "sample_future"):
+                baseline_fut = [sampler.sample_future(hist_df, fut_df, col, j) for j in range(len(y_fut))]
+                if len(y_fut) == 1:
+                    ax_fut.hlines(baseline_fut[0], -0.4, 0.4, color="red", linewidth=1.2, alpha=0.7, zorder=3)
+                else:
+                    ax_fut.plot(range(len(y_fut)), baseline_fut, color="red", linewidth=1.2, alpha=0.7, zorder=3)
             if len(y_fut) == 1:
                 value = fut_coeffs.get(1, 0.0)
-                ax_fut.bar(0, y_fut[0], color=cmap(norm(value)), alpha=0.6, edgecolor="none")
+                bottom = baseline_fut[0] if baseline_fut is not None else 0.0
+                ax_fut.bar(0, y_fut[0] - bottom, bottom=bottom, color=cmap(norm(value)), alpha=0.6, edgecolor="none")
                 label(ax_fut, 0, value)
             else:
                 ax_fut.plot(range(len(y_fut)), y_fut)
                 for j in range(len(y_fut)):
                     value = fut_coeffs.get(j + 1, 0.0)
-                    ax_fut.axvspan(j - 0.5, j + 0.5, facecolor=cmap(norm(value)), alpha=0.5, zorder=0)
+                    if baseline_fut is None:
+                        ax_fut.axvspan(j - 0.5, j + 0.5, facecolor=cmap(norm(value)), alpha=0.5, zorder=0)
+                    else:
+                        # Fill the gap over the half-step on each side of j, interpolating both lines
+                        xs = [max(j - 0.5, 0), j, min(j + 0.5, len(y_fut) - 1)]
+                        ax_fut.fill_between(
+                            xs,
+                            np.interp(xs, range(len(y_fut)), y_fut),
+                            np.interp(xs, range(len(y_fut)), baseline_fut),
+                            color=cmap(norm(value)),
+                            alpha=0.7,
+                            linewidth=0,
+                        )
                     label(ax_fut, j, value)
                 for j in range(len(y_fut) - 1):
                     ax_fut.axvline(x=j + 0.5, color="darkgray", linestyle="--", linewidth=1.0)
@@ -217,7 +293,7 @@ def plot_shap_values(
         ax_static.set_yticks([])
         ax_static.set_title("Static features", fontsize=9)
 
-    ticks = [s * max_val / d for s in (-1, 1) for d in (1, 10, 100)] + [0.0]
+    ticks = [s * max_val * f for s in (-1, 1) for f in (1, 0.5)] + [0.0]
     cbar = fig.colorbar(
         cm.ScalarMappable(norm=norm, cmap=cmap),
         ax=fig.axes,

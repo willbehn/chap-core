@@ -184,6 +184,7 @@ def explain(
     seed: int | None = None,
     last_n: int = 36,
     granularity: int = 1,
+    fast: bool = False,
     run_config: RunConfigArg = RunConfig(),
 ):
     from chap_core.explainability.kernel_shap import explain
@@ -229,6 +230,7 @@ def explain(
                 granularity=granularity,
                 save=True,
                 plot=True,
+                fast=fast,
             )
 
             for name, value in results:
