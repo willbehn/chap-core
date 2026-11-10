@@ -28,10 +28,10 @@ logger = logging.getLogger(__name__)
 # Some of the samplers for lime might not work as intended for shap, will update
 # with more samplers
 def _check_allowed_sampler(sampler_name: str):
-    allowed_samplers = {"global_mean", "background", "climatology_monthly", "fourier"}  # TODO expand with other samplers later
+    allowed_samplers = {"global_mean", "climatology_monthly"}  # TODO expand with other samplers later
 
     if sampler_name not in allowed_samplers:
-        raise ValueError("Sampler not supported")
+        raise ValueError(f"Sampler {sampler_name} not supported. Use one of the samplers in {allowed_samplers}")
 
     return sampler_name
 
@@ -65,11 +65,11 @@ def _explain_shap(
 
     features_to_groups = np.asarray(groups)
 
-    #print(f"Feature to groups: {features_to_groups}")
+    # print(f"Feature to groups: {features_to_groups}")
 
     def value_fn(player_masks: np.ndarray) -> np.ndarray:
         masks = player_masks[:, features_to_groups]
-        #print(masks)
+        # print(masks)
 
         perturbations, perturbation_masks = perturb_vectors(
             inputs.hist_df,
@@ -118,7 +118,9 @@ def _explain_shap(
     # Prediction, all players have their real value
     prediction = float(explainer.fx[0])
 
-    logger.info(f"prediction={prediction:.4f}  baseline={baseline_prediction:.4f}  sum(SHAP)={np.sum(shap_values):.4f}  prediction-baseline={prediction - baseline_prediction:.4f}")
+    logger.info(
+        f"prediction={prediction:.4f}  baseline={baseline_prediction:.4f}  sum(SHAP)={np.sum(shap_values):.4f}  prediction-baseline={prediction - baseline_prediction:.4f}"
+    )
 
     results = sorted(zip(player_names, np.asarray(shap_values).ravel().tolist(), strict=True), key=lambda item: item[0])
     return results, prediction, baseline_prediction
@@ -142,12 +144,24 @@ def explain(
     plot: bool = False,
     fast: bool = False,
 ) -> list[tuple[str, float]]:
+    """
+    Explain one location's forecast with Kernel SHAP.
 
+    Returns a list of (feature name, SHAP value) pairs. The values sum to
+    prediction - baseline prediction.
+
+    Notes:
+        ``sampler_name`` is the baseline: ``global_mean`` or ``climatology_monthly``.
+        ``climatology_monthly`` requires ``last_n``.
+        ``fast`` groups each input into one player and computes exact SHAP
+        (``2**num_inputs`` coalitions), ignoring ``num_perturbations``.
+        ``scope_explanation`` and ``prune_threshold`` are disabled for now (WIP).
+    """
     start = time.perf_counter()
     if timed:
         logger.info("Started SHAP pipeline")
 
-    #TODO will currently crash when true, will fix later
+    # TODO will currently crash when true, WIP
     if scope_explanation and False:
         if prune_threshold is None:
             raise ValueError("prune_threshold must be set when scope_explanation is True")
@@ -235,12 +249,16 @@ def explain(
         saved_dir = md_path.parent
 
     if plot:
-        
         if not fast:
             plot_path = saved_dir / "importance_plot.png" if saved_dir is not None else None
 
             plot_shap_values(
-                result, inputs.hist_df, inputs.future_df, inputs.feat_indices, sampler=inputs.sampler, save_path=plot_path
+                result,
+                inputs.hist_df,
+                inputs.future_df,
+                inputs.feat_indices,
+                sampler=inputs.sampler,
+                save_path=plot_path,
             )
 
         waterfall_plot_path = saved_dir / "waterfall_plot.png" if saved_dir is not None else None
@@ -251,9 +269,7 @@ def explain(
 
 # Helper function that removes static features from feature_map. This will result in the static features allways have
 # their actual value when running predict for when both groups are on.
-def drop_static_features(
-    feature_map: list[tuple[str, str, int | None]]
-) -> list[tuple[str, str, int | None]]:
+def drop_static_features(feature_map: list[tuple[str, str, int | None]]) -> list[tuple[str, str, int | None]]:
 
     # Keeps only features that has lags or that is a future feature
     return [entry for entry in feature_map if entry[2] is not None or "_fut_" in entry[0]]
@@ -265,13 +281,13 @@ def group_by_variable(feature_map: list[tuple[str, str, int | None]]) -> tuple[l
     variables = [re.sub(r"_(seg|fut)_\d+$", "", name) for name, _, _ in feature_map]
     player_names = list(dict.fromkeys(variables))
     groups = [player_names.index(variable) for variable in variables]
-    
+
     return groups, player_names
 
 
 # Helper function to group features into the old/new player game when doing timeshap-ish pruning
 def group_two_player_split(feature_map: list[tuple[str, str, int | None]]) -> list[int]:
-    #print(feature_map)
+    # print(feature_map)
 
     # 0 is new, 1 is old, _fut_ will be added in new segments
     # TODO think also _seg_10... etc can be added, fix later
@@ -293,7 +309,7 @@ def find_temporal_prune_depth(
     timed: bool,
     start: float,
     threshold: float,
-) -> tuple[int, list[float]]: #TODO change return value later after testing
+) -> tuple[int, list[float]]:  # TODO change return value later after testing
 
     max_depth = len(dataset.period_range)
     print(f"Starting temporal pruning, max depth={max_depth}")
@@ -305,7 +321,7 @@ def find_temporal_prune_depth(
         print(f"    At split index {split_index}")
 
         """
-        TODO regarding segmentation REMEBER TO REMOVE
+        TODO regarding segmentation WIP
         I need to pass down arguemtns to the segmenter from this call since I need to call it multiple times
         My solution now is to change segmenter argument to also accept a object of segmentation model
         Issues: Comlpicated code, and I need to rerun data preperation for each time I want to change the segmentation
@@ -362,7 +378,7 @@ def find_temporal_prune_depth(
         Problems: Model can be probabilistc, so a lot of noice between calls that are not from the split
         """
         if abs(old_val) < threshold:
-            #return split_index
-            continue # TODO just for testing
+            # return split_index
+            continue  # TODO just for testing
 
     return 0, all_shap_values

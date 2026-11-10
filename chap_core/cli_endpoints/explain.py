@@ -174,7 +174,6 @@ def explain_lime(
                 for key, value in metrics.items():
                     logger.info(f"  {key:>15} = {value:+.4f}")
 
-# TODO Very temporary endpoint, just for testing
 def explain(
     model_name: ModelNameArg,
     dataset_csv: DatasetCsvArg,
@@ -187,14 +186,35 @@ def explain(
     granularity: int = 1,
     fast: bool = False,
     run_config: RunConfigArg = RunConfig(),
+    baseline: str = "climatology_monthly",
 ):
-    from chap_core.explainability.kernel_shap import explain
+    """
+    Explain a model's prediction with SHAP (temporary docs).
+
+    Note: under development. Debug comments are still in place and tests
+    are not done yet.
+
+    Requirements:
+        Reuses the model's working directory from an earlier run, so
+        `chap eval` must be run with the same model first.
+
+    Baseline:
+        The explanation is relative to a baseline (reference) value, set with
+        --baseline: "global_mean" or "climatology_monthly" (default).
+
+    Features (players):
+        Default (granularity=1): each input's historic data is one group,
+        and each future value (one per horizon step) is its own feature.
+
+        --fast: each input (historic and future together) is one group,
+        so one SHAP player per input.
+    """
+
+    from chap_core.explainability.kernel_shap import explain as explain_shap
     from chap_core.log_config import initialize_logging
     from chap_core.models.model_template import ModelTemplate
 
-    sampler_name = "climatology_monthly"
-
-    logger.info(f"SHAPSHAPSHAPSHAP\n Explaining model {model_name} using SHAP with background {sampler_name}")
+    logger.info(f"Explaining model {model_name} using SHAP with background {baseline}")
 
     initialize_logging(run_config.debug, run_config.log_file)
 
@@ -219,13 +239,13 @@ def explain(
         for loc in locations:
             logger.info(f"Generating SHAP explanation for {loc}, {horizon} time steps into the future")
 
-            results = explain(
+            results = explain_shap(
                 model=estimator,
                 dataset=dataset,
                 location=loc,
                 horizon=horizon,
                 num_perturbations=num_perturbations,
-                sampler_name = sampler_name,
+                sampler_name = baseline,
                 seed=seed,
                 last_n=last_n,
                 granularity=granularity,
