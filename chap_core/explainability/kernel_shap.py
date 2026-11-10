@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Some of the samplers for lime might not work as intended for shap, will update
 # with more samplers
 def _check_allowed_sampler(sampler_name: str):
-    allowed_samplers = {"global_mean", "background", "climatology_monthly"}  # TODO expand with other samplers later
+    allowed_samplers = {"global_mean", "background", "climatology_monthly", "fourier"}  # TODO expand with other samplers later
 
     if sampler_name not in allowed_samplers:
         raise ValueError("Sampler not supported")
@@ -238,7 +238,7 @@ def explain(
         
         if not fast:
             plot_path = saved_dir / "importance_plot.png" if saved_dir is not None else None
-            
+
             plot_shap_values(
                 result, inputs.hist_df, inputs.future_df, inputs.feat_indices, sampler=inputs.sampler, save_path=plot_path
             )

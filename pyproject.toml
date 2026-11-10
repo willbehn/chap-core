@@ -64,6 +64,7 @@ dependencies = [
     "stumpy>=1.14.1",
     "pyts>=0.13.0",
     "fastdtw>=0.3.4",
+    "shap>=0.54.1",
 ]
 
 [dependency-groups]
