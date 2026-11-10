@@ -2,6 +2,7 @@ import logging
 from typing import Annotated, Any, Literal
 
 import numpy as np
+import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import Field as PydanticField
@@ -20,6 +21,12 @@ from chap_core.api_types import (
     PredictionEntry,
 )
 from chap_core.assessment.dataset_splitting import train_test_generator
+from chap_core.assessment.flat_representations import DataDimension
+from chap_core.assessment.outbreak_metrics import (
+    OutbreakMetricKind,
+    get_binary_outbreak_metrics,
+    get_categorical_outbreak_metrics,
+)
 from chap_core.assessment.thresholds import list_threshold_strategies
 from chap_core.assessment.thresholds.params import ThresholdParams
 from chap_core.assessment.weather_providers import list_weather_providers
@@ -39,10 +46,13 @@ from chap_core.database.tables import (
     is_not_baseline_backtest,
 )
 from chap_core.datatypes import create_tsdataclass
+from chap_core.exceptions import InvalidDateError
 from chap_core.services import threshold_service
 from chap_core.services.dataset_validation import RESERVED_FIELDS
 from chap_core.spatio_temporal_data.converters import observations_to_dataset
 from chap_core.spatio_temporal_data.temporal_dataclass import DataSet
+from chap_core.time_period import TimePeriod
+from chap_core.time_period.date_util_wrapper import clean_timestring
 
 from ...celery_tasks import JOB_METADATA_KW, JOB_NAME_KW, JOB_REQUEST_KW, JOB_TYPE_KW, CeleryPool, JobType
 from ...data_models import (
@@ -59,12 +69,12 @@ from ...data_models import (
     MakeBacktestsResponse,
     MakeBacktestWithDataRequest,
     MakePredictionRequest,
+    ObservationColumns,
     PredictionParams,
     ValidationError,
 )
 from .dependencies import (
     check_masked_ranges_match,
-    get_database_url,
     get_job_model,
     get_job_request,
     get_session,
@@ -72,6 +82,9 @@ from .dependencies import (
     get_settings_manager,
     model_job_metadata,
     reject_mask_indicator_input,
+    require_dataset_target,
+    require_target_column,
+    within_model_horizon,
 )
 
 router = APIRouter(prefix="/analytics")
@@ -92,7 +105,6 @@ def make_dataset(
     dry_run: bool = Query(
         False, description="If True, only run validation and do not import the dataset", alias="dryRun"
     ),
-    database_url: str = Depends(get_database_url),
     worker_settings=Depends(get_settings),
 ):
     """Persist observations (with polygons) as a named dataset you can reuse across backtests and predictions.
@@ -104,11 +116,14 @@ def make_dataset(
     ``/v1/jobs/{id}`` to know when the dataset is queryable. Pass ``dryRun=true`` to run
     validation only and get the rejection summary without queuing an import.
 
+    ``targetColumn`` selects the column to predict (default ``disease_cases``). It is
+    saved with the dataset and reused by its runs; a different target needs a new dataset.
+
     ``maskedRanges`` deletes data: ``disease_cases`` inside the ranges is stored as empty
     and the submitted values are not kept. They cannot be recovered or unmasked later.
     """
     feature_names, provided_data, rejections = _read_and_validate_dataset(request, dry_run)
-    check_masked_ranges_match(request.masked_ranges, provided_data)
+    check_masked_ranges_match(request.masked_ranges, provided_data, request.target_column)
     imported_count = len(list(provided_data.locations()))
     if dry_run:
         return ImportSummaryResponse(id=None, imported_count=imported_count, rejected=rejections)
@@ -123,14 +138,16 @@ def make_dataset(
         request.type,
         data_sources=request.data_sources,
         masked_ranges=request.masked_ranges,
-        database_url=database_url,
+        target_column=request.target_column,
         worker_config=worker_settings,
         **{
             JOB_REQUEST_KW: original_request,
             JOB_TYPE_KW: JobType.DATASET,
             JOB_NAME_KW: request.name,
             JOB_METADATA_KW: {
-                "parameters": request.model_dump(mode="json", exclude={"name", "geojson", "provided_data"})
+                "parameters": request.model_dump(
+                    mode="json", exclude={"name", "geojson", "provided_data", "provided_data_columns"}
+                )
             },
         },
     )
@@ -158,7 +175,7 @@ def _read_and_validate_dataset(request, dry_run: bool) -> tuple[list[str], DataS
     """
     try:
         feature_names, provided_data = _read_dataset(request)
-        provided_data, rejections = validate_full_dataset(feature_names, provided_data)
+        provided_data, rejections = validate_full_dataset(feature_names, provided_data, request.target_column)
     except HTTPException as exc:
         if not dry_run or exc.status_code != 400:
             raise
@@ -179,26 +196,71 @@ def _read_and_validate_dataset(request, dry_run: bool) -> tuple[list[str], DataS
 
 
 def _read_dataset(request):
-    if not request.provided_data:
+    # Only make-dataset accepts columnar observations; create-backtest-with-data shares this reader.
+    columns = getattr(request, "provided_data_columns", None)
+    if not request.provided_data and (columns is None or not columns.org_unit):
         raise HTTPException(status_code=400, detail="No observation data provided.")
-    feature_names = list({entry.feature_name for entry in request.provided_data})
+    if columns is not None:
+        feature_names = list(columns.values)
+    else:
+        feature_names = list({entry.feature_name for entry in request.provided_data})
     reject_mask_indicator_input(feature_names)
+    require_target_column(request.target_column, feature_names)
     dataclass = create_tsdataclass(feature_names)
-    provided_data = observations_to_dataset(dataclass, request.provided_data, fill_missing=True)
+    if columns is not None:
+        provided_data = _columns_to_dataset(dataclass, columns)
+    else:
+        provided_data = observations_to_dataset(dataclass, request.provided_data, fill_missing=True)
     if "population" in feature_names:
         provided_data = provided_data.interpolate(["population"])
     return feature_names, provided_data
 
 
+def _columns_to_dataset(dataclass, columns: ObservationColumns) -> DataSet:
+    """Build the dataset straight from columnar observations, without one model per observation."""
+    frame = pd.DataFrame(
+        {
+            "location": columns.org_unit,
+            "time_period": columns.period,
+            **{name: np.array(values, dtype=float) for name, values in columns.values.items()},
+        }
+    )
+    # `2024W1`, `2024W01` and `2024-W01` are the same week, so compare periods in their parsed form.
+    frame["time_period"] = frame["time_period"].map({period: _period_id(period) for period in set(columns.period)})
+    duplicated = frame.duplicated(["location", "time_period"])
+    if duplicated.any():
+        first = frame[duplicated].iloc[0]
+        raise HTTPException(
+            status_code=422,
+            detail=f"providedDataColumns has more than one row for org unit {first.location!r}, "
+            f"period {first.time_period!r}",
+        )
+    return DataSet.from_pandas(frame, dataclass, fill_missing=True)
+
+
+def _period_id(period: str) -> str:
+    """The canonical id of a period string, or the string itself when it does not parse.
+
+    A period that does not parse is left for `DataSet.from_pandas` to reject, as before.
+    """
+    try:
+        return str(TimePeriod.parse(clean_timestring(period)).id)
+    except (ValueError, InvalidDateError):
+        return period
+
+
 def _find_locations_with_complete_covariates(
     dataset: DataSet, feature_names: list[str], target_name: str = "disease_cases"
 ) -> tuple[set[str], list[ValidationError]]:
-    """Identify locations that have no NaN values in covariate features."""
+    """Identify locations that have no NaN values in covariate features.
+
+    Neither the target nor `disease_cases` is a covariate: runs replace `disease_cases` with the target.
+    """
     locations_to_keep = set()
     rejected_list = []
     for location, data in dataset.items():
         for feature_name in feature_names:
-            if feature_name == target_name:
+            if feature_name in (target_name, "disease_cases"):
                 continue
             isnan = np.isnan(getattr(data, feature_name))
             if np.any(isnan):
@@ -470,7 +532,6 @@ async def get_evaluation_entries(
 def create_backtest(
     request: MakeBacktestRequest,
     original_request: dict = Depends(get_job_request),
-    database_url: str = Depends(get_database_url),
     session: Session = Depends(get_session),
     settings_manager: SettingsManager = Depends(get_settings_manager),
 ):
@@ -478,13 +539,13 @@ def create_backtest(
 
     Runs asynchronously; you get a job id and poll ``/v1/jobs/{id}`` (or
     ``/v1/jobs/{id}/evaluation_result`` once finished) to find the resulting backtest.
-    404 if the referenced dataset does not exist; 422 if targetColumn is not a dataset column.
+    Uses the dataset's saved target. A supplied targetColumn must match it, otherwise returns 422.
+    Returns 404 if the referenced dataset does not exist, and 409 if the configured model has been deleted.
     """
     stored_dataset = session.get(DataSetTable, request.dataset_id)
     if stored_dataset is None:
         raise HTTPException(status_code=404, detail=f"Dataset {request.dataset_id} not found")
-    if request.target_column not in stored_dataset.covariates:
-        raise HTTPException(status_code=422, detail=f"Dataset has no target column {request.target_column!r}")
+    target_column = require_dataset_target(stored_dataset, request.target_column)
     params = _resolve_backtest_params(settings_manager.get(), request, stored_dataset.period_type)
     if stored_dataset.masked_ranges:
         try:
@@ -494,7 +555,6 @@ def create_backtest(
                 params.n_periods,
                 params.n_splits,
                 params.stride,
-                target_column=request.target_column,
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
@@ -503,16 +563,15 @@ def create_backtest(
         wf.run_backtest,
         BacktestCreate(name=request.name, dataset_id=request.dataset_id, model_id=model.id),
         **params.model_dump(),
-        target_column=request.target_column,
-        baseline_database_url=database_url,
-        database_url=database_url,
+        target_column=target_column,
+        queue_baselines=True,
         **{
             JOB_REQUEST_KW: original_request,
             JOB_TYPE_KW: JobType.EVALUATION_LEGACY,
             JOB_NAME_KW: request.name,
             JOB_METADATA_KW: model_job_metadata(
                 model,
-                {**params.model_dump(mode="json"), "target_column": request.target_column},
+                {**params.model_dump(mode="json"), "target_column": target_column},
                 request.dataset_id,
             ),
         },
@@ -530,7 +589,6 @@ def create_backtest(
 def create_backtests(
     request: MakeBacktestsRequest,
     original_request: dict = Depends(get_job_request),
-    database_url: str = Depends(get_database_url),
     session: Session = Depends(get_session),
     settings_manager: SettingsManager = Depends(get_settings_manager),
 ):
@@ -541,18 +599,20 @@ def create_backtests(
     which every backtest of the run files, so the results can be fetched from
     ``GET /v1/crud/backtest-specifications/{id}`` without a second lookup, plus one job id
     per model to poll via ``/v1/jobs/{id}``. 404 if the dataset or a model does not exist,
-    422 if targetColumn is not a dataset column or no org unit has target data left to train on.
+    Uses the dataset's saved target. Returns 422 if a supplied targetColumn differs from it
+    or no org unit has target data left to train on.
     """
     stored_dataset = session.get(DataSetTable, request.dataset_id)
     if stored_dataset is None:
         raise HTTPException(status_code=404, detail=f"Dataset {request.dataset_id} not found")
     wrapper = SessionWrapper(session=session)
+    target_column = require_dataset_target(stored_dataset, request.target_column)
     params = _resolve_backtest_params(settings_manager.get(), request, stored_dataset.period_type)
     models = [get_job_model(session, model_id) for model_id in request.model_ids]
     try:
-        dataset = wf.load_masked_dataset(session, request.dataset_id, request.target_column)
+        dataset, _ = wf.load_masked_dataset(session, request.dataset_id)
         _, specification = wf.resolve_backtest_specification(
-            wrapper, dataset, request.dataset_id, params, target_column=request.target_column
+            wrapper, dataset, request.dataset_id, params, target_column=target_column
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -564,16 +624,15 @@ def create_backtests(
             wf.run_backtest,
             BacktestCreate(name=name, dataset_id=request.dataset_id, model_id=model.id),
             **params.model_dump(),
-            target_column=request.target_column,
-            baseline_database_url=database_url,
-            database_url=database_url,
+            target_column=target_column,
+            queue_baselines=True,
             **{
                 JOB_REQUEST_KW: original_request,
                 JOB_TYPE_KW: JobType.EVALUATION_LEGACY,
                 JOB_NAME_KW: name,
                 JOB_METADATA_KW: model_job_metadata(
                     model,
-                    {**params.model_dump(mode="json"), "target_column": request.target_column},
+                    {**params.model_dump(mode="json"), "target_column": target_column},
                     request.dataset_id,
                 ),
             },
@@ -593,9 +652,9 @@ def create_backtests(
 async def make_prediction(
     request: MakePredictionRequest,
     original_request: dict = Depends(get_job_request),
-    database_url=Depends(get_database_url),
     worker_settings=Depends(get_settings),
     session: Session = Depends(get_session),
+    settings_manager: SettingsManager = Depends(get_settings_manager),
 ):
     """Run a forecast against observations supplied directly in the request body — no stored dataset needed.
 
@@ -605,23 +664,33 @@ async def make_prediction(
 
     Forecasting happens in the background; the response carries a job id you poll via
     ``/v1/jobs/{id}`` for the result. The legacy ``data_to_be_fetched`` field is
-    rejected — supply the observations directly.
+    rejected — supply the observations directly. Without ``nPeriods``, the stored default
+    for the data's period type is used, kept within the range the model supports.
     """
     request.type = "prediction"
     feature_names = list({entry.feature_name for entry in request.provided_data})
     reject_mask_indicator_input(feature_names)
+    require_target_column(request.target_column, feature_names)
     dataclass = create_tsdataclass(feature_names)
     provided_data = observations_to_dataset(dataclass, request.provided_data, fill_missing=True)
     if "population" in feature_names:
         provided_data = provided_data.interpolate(["population"])
-    provided_data, _rejections = validate_full_dataset(feature_names, provided_data)
+    model = get_job_model(session, request.model_id)
+    n_periods = request.n_periods
+    if n_periods is None:
+        try:
+            period_type = period_type_of(provided_data.period_range[0])
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        stored_default = settings_manager.get().backtest_params(period_type).n_periods
+        n_periods = within_model_horizon(stored_default, model.model_template)
+    provided_data, _rejections = validate_full_dataset(feature_names, provided_data, request.target_column)
     provided_data.set_polygons(FeatureCollectionModel.model_validate(request.geojson))
     if request.data_to_be_fetched:
         raise HTTPException(status_code=404, detail="Data to be fetched is no longer supported by chap-core")
     dump = request.model_dump()
     dataset_info = DataSetCreateInfo(**dump).model_dump()
-    prediction_params = PredictionParams(**dump)
-    model = get_job_model(session, request.model_id)
+    prediction_params = PredictionParams(**(dump | {"n_periods": n_periods}))
     job = worker.queue_db(
         wf.predict_pipeline_from_composite_dataset,
         feature_names,
@@ -630,7 +699,6 @@ async def make_prediction(
         dataset_create_info=dataset_info,
         prediction_params=prediction_params,
         configured_model_id=model.id,
-        database_url=database_url,
         worker_config=worker_settings,
         **{
             JOB_REQUEST_KW: original_request,
@@ -695,18 +763,17 @@ async def get_actual_cases(
     is_dataset_id: bool = Query(False, alias="isDatasetId"),
     session: Session = Depends(get_session),
 ):
-    """Pull the actual ``disease_cases`` series from the dataset that backs a backtest, so a plot can show forecast vs. reality on the same axes.
+    """Pull the actual target series from the dataset that backs a backtest, so a plot can show forecast vs. reality on the same axes.
 
     Filter to specific regions with ``orgUnits``, or pass ``orgUnits=["adm0"]`` to get
     one summed series across every region (useful for national-level views). Set
     ``isDatasetId=true`` to skip the backtest lookup and read directly from a dataset
-    id. 404 if the backtest is unknown (and ``isDatasetId`` is false).
+    id. 404 if the backtest, or with ``isDatasetId=true`` the dataset, is unknown.
     """
     return_summed = False
     if org_units is not None and len(org_units) == 1 and org_units[0] == "adm0":
         # returning sum of forecasts for all regions
         return_summed = True
-    target_column = "disease_cases"
     if not is_dataset_id:
         backtest = session.get(Backtest, backtest_id)
         logger.info(f"Backtest: {backtest}")
@@ -716,6 +783,10 @@ async def get_actual_cases(
         target_column = backtest.specification.target_column
     else:
         dataset_id = backtest_id
+        dataset = session.get(DataSetTable, dataset_id)
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        target_column = dataset.target_column
     observations = DataSetManager(session).observations(
         dataset_id,
         org_units=None if return_summed else org_units,
@@ -743,7 +814,7 @@ async def get_actual_cases(
                 summed_values[key] += element.value
         data_list = [DataElement(pe=pe, ou="adm0", value=value) for pe, value in summed_values.items()]
     logger.info(f"DataList: {len(data_list)}")
-    return DataList(featureId="disease_cases", dhis2Id="disease_cases", data=data_list)
+    return DataList(featureId=target_column, dhis2Id=target_column, data=data_list)
 
 
 data_sources = [
@@ -893,7 +964,6 @@ async def create_backtest_with_data(
     dry_run: bool = Query(
         False, description="If True, only run validation and do not create a backtest", alias="dryRun"
     ),
-    database_url: str = Depends(get_database_url),
     worker_settings=Depends(get_settings),
     session: Session = Depends(get_session),
     settings_manager: SettingsManager = Depends(get_settings_manager),
@@ -917,7 +987,7 @@ async def create_backtest_with_data(
     train_set, _ = train_test_generator(
         provided_data_processed, backtest_params.n_periods, backtest_params.n_splits, stride=backtest_params.stride
     )
-    locations_to_keep, target_rejections = _find_locations_with_target_data(train_set)
+    locations_to_keep, target_rejections = _find_locations_with_target_data(train_set, request.target_column)
     provided_data_processed = _filter_dataset_by_locations(provided_data_processed, locations_to_keep)
     rejections.extend(target_rejections)
     imported_count = len(list(provided_data_processed.locations()))
@@ -947,9 +1017,8 @@ async def create_backtest_with_data(
         backtest_name=request.name,
         model_id=model.id,
         backtest_params=bt_params,
-        database_url=database_url,
         worker_config=worker_settings,
-        baseline_database_url=database_url,
+        queue_baselines=True,
         **{
             JOB_REQUEST_KW: original_request,
             JOB_TYPE_KW: JobType.EVALUATION,
@@ -1127,19 +1196,27 @@ def list_threshold_strategy_types():
     summary="Compute thresholds (endemic channel) for a dataset",
 )
 def compute_thresholds(request: ThresholdRequest, session: Session = Depends(get_session)):
-    """Compute outbreak threshold lines per (period, org unit) from a dataset's historical disease_cases.
+    """Compute outbreak threshold lines per (period, org unit) from a dataset's historical target values.
 
     The `type` field of `params` selects the strategy; the strategy's line parameter
     (`quantile`, `stdMultiplier`, ...) accepts a scalar or a list, and each entry's `values`
     array holds one threshold per requested line, in the order of `lines`. Every requested
     (period, location) gets an entry; cells no threshold could be computed for are `null`.
     404 if the dataset has
-    no `disease_cases` observations. 400 if the requested periods do not match the dataset's
+    no target observations. 400 if the requested periods do not match the dataset's
     frequency, or if the dataset has no complete year to compute a baseline from.
     """
+    dataset = session.get(DataSetTable, request.dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Dataset not found")
     try:
         result = threshold_service.compute_thresholds(
-            session, request.dataset_id, request.period_ids, request.params, request.locations
+            session,
+            request.dataset_id,
+            request.period_ids,
+            request.params,
+            request.locations,
+            target_column=dataset.target_column,
         )
     except threshold_service.NoObservationsError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
@@ -1163,3 +1240,137 @@ def compute_thresholds(request: ThresholdRequest, session: Session = Depends(get
         for location, row in zip(locations, per_location, strict=True)
     ]
     return ThresholdResponse(params=request.params, lines=lines, entries=entries)
+
+
+class OutbreakMetricInfo(DBModel):
+    """Catalogue entry for one registered outbreak metric."""
+
+    id: str = Field(description="Metric identifier, the key it is reported under.")
+    display_name: str = Field(description="Human-friendly metric name.")
+    description: str = Field(default="", description="What the metric measures.")
+    kind: OutbreakMetricKind = Field(
+        description="`binary` metrics are reported per alert level; `categorical` metrics judge the policy as a whole."
+    )
+
+
+class LevelOutbreakMetrics(DBModel):
+    """Binary metrics for one alert level."""
+
+    level: str = Field(description="Name of the alert level.")
+    metrics: dict[str, float | None] = Field(
+        description="Value per binary metric id. `null` where undefined, e.g. sensitivity when no cell was an outbreak."
+    )
+
+
+class OutbreakMetricsRow(DBModel):
+    """Outbreak metrics for one group of cells."""
+
+    location: str | None = Field(default=None, description="Location of the group; `null` unless grouped by it.")
+    time_period: str | None = Field(default=None, description="Period of the group; `null` unless grouped by it.")
+    horizon_distance: int | None = Field(default=None, description="Horizon of the group; `null` unless grouped by it.")
+    n_cells: int = Field(description="Number of (location, period, horizon) cells scored.")
+    levels: list[LevelOutbreakMetrics] = Field(description="One entry per policy level, least to most severe.")
+    categorical: dict[str, float | None] = Field(
+        description="Value per categorical metric id, judging the most severe level breached. `null` where undefined."
+    )
+
+
+class OutbreakMetricsResponse(DBModel):
+    """Outbreak-detection metrics of a backtest judged against an alert policy."""
+
+    categories: list[str] = Field(
+        description="Category names in severity order, as the categorical metrics see them: "
+        "`none` followed by the level names."
+    )
+    rows: list[OutbreakMetricsRow] = Field(
+        description="One row per group, in sorted group order; a single row when not grouped."
+    )
+
+
+@router.get(
+    "/outbreak-metrics",
+    response_model=list[OutbreakMetricInfo],
+    tags=["Metrics"],
+    summary="Discover which outbreak metrics are available",
+)
+def list_outbreak_metrics():
+    """List the registered outbreak metrics, binary ones (per alert level) and categorical ones (per policy).
+
+    The ids are the keys the metrics are reported under by
+    `GET /v1/analytics/backtests/{backtestId}/outbreak-metrics`.
+    """
+    specs = [*get_binary_outbreak_metrics().values(), *get_categorical_outbreak_metrics().values()]
+    return [
+        OutbreakMetricInfo(id=spec.id, display_name=spec.name, description=spec.description, kind=spec.kind)
+        for spec in specs
+    ]
+
+
+@router.get(
+    "/backtests/{backtestId}/outbreak-metrics",
+    response_model=OutbreakMetricsResponse,
+    tags=["Metrics"],
+    summary="Score a backtest's outbreak alerts against an alert policy",
+)
+def get_outbreak_metrics(
+    backtest_id: Annotated[int, Path(alias="backtestId")],
+    alert_policy_id: Annotated[int, Query(alias="alertPolicyId")],
+    group_by: Annotated[list[DataDimension] | None, Query(alias="groupBy")] = None,
+    session: Session = Depends(get_session),
+):
+    """Judge how well a backtest's forecasts would have raised the alerts of an alert policy.
+
+    Each level's threshold is computed by its strategy, as in `POST /v1/analytics/thresholds`,
+    per split from the observations before the split's first forecast period: what a live
+    run with that history would have used. A cell (location, period, horizon) is an outbreak
+    at a level when observed cases exceed the threshold, and is alerted when the share of
+    forecast samples above it reaches the level's `exceedanceThreshold`. Every level gets the
+    binary metrics; the levels together get the categorical metrics on the most severe level
+    breached. See `GET /v1/analytics/outbreak-metrics` for the metrics.
+
+    `groupBy` (repeatable: `location`, `time_period`, `horizon_distance`) splits the cells
+    into one row per group; without it every cell is pooled into one row.
+
+    404 if the backtest or policy is unknown; 400 if the policy has no levels, no threshold
+    can be computed, or no cell has both an observation and a threshold at every level.
+    """
+    from chap_core.assessment.evaluation import Evaluation
+    from chap_core.assessment.outbreak_metrics.scoring import label_cells, score
+    from chap_core.database.alert_tables import AlertPolicy
+
+    backtest = session.get(Backtest, backtest_id)
+    if backtest is None:
+        raise HTTPException(status_code=404, detail="Backtest not found")
+    policy = session.get(AlertPolicy, alert_policy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail="Alert policy not found")
+    if not policy.levels:
+        raise HTTPException(status_code=400, detail=f"Alert policy {alert_policy_id} has no levels")
+
+    flat = Evaluation.from_backtest(backtest).to_flat()
+    try:
+        labelled = label_cells(pd.DataFrame(flat.observations), pd.DataFrame(flat.forecasts), policy.levels)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if labelled.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="No cell to score: no forecast period has an observation and a threshold at every level",
+        )
+
+    dimensions = [str(dim) for dim in dict.fromkeys(group_by or [])]
+    return OutbreakMetricsResponse(
+        categories=["none", *(level.name for level in policy.levels)],
+        rows=[
+            OutbreakMetricsRow(
+                **group.group,
+                n_cells=group.n_cells,
+                levels=[
+                    LevelOutbreakMetrics(level=level.name, metrics=metrics)
+                    for level, metrics in zip(policy.levels, group.levels, strict=True)
+                ],
+                categorical=group.categorical,
+            )
+            for group in score(labelled, len(policy.levels), dimensions)
+        ],
+    )

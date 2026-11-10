@@ -1,4 +1,5 @@
 import logging
+import math
 
 # CHeck if CHAP_DATABASE_URL is set in the environment
 import os
@@ -21,6 +22,7 @@ from ..external.model_configuration import ModelTemplateConfigV2
 from ..models import ModelTemplate
 from ..models.configured_model import ConfiguredModel
 from ..models.external_chapkit_model import ExternalChapkitModelTemplate
+from .dataset_tables import DataSet, Observation
 from .model_spec_tables import ModelSpecRead
 from .model_templates_and_config_tables import (
     ConfiguredModelDB,
@@ -31,7 +33,7 @@ from .model_templates_and_config_tables import (
     compute_configuration_digest,
     drifted_template_content_fields,
 )
-from .tables import Backtest, BacktestSpecification, Prediction, PredictionSamplesEntry
+from .tables import Backtest, BacktestSpecification, Prediction, PredictionSamplesEntry, PredictionSetupObservation
 
 logger = logging.getLogger(__name__)
 engine = None
@@ -261,24 +263,9 @@ class SessionWrapper:
 
         # check if this exact configuration already exists
         digest = compute_configuration_digest(configuration)
-        identical_configured_model = self.session.exec(
-            select(ConfiguredModelDB).where(
-                ConfiguredModelDB.model_template_id == model_template_id,
-                ConfiguredModelDB.name == name,
-                ConfiguredModelDB.configuration_digest == digest,
-            )
-        ).first()
+        identical_configured_model = self._identical_configured_model(model_template_id, name, digest)
         if identical_configured_model:
-            logger.info(
-                f"Configured model {name} with an identical configuration already exists. Returning existing id"
-            )
-            reactivated_model_id = cast("int", identical_configured_model.id)
-            # Re-adding an archived configuration shows it again.
-            identical_configured_model.archived = False
-            # Still flip is_live so that re-adding a previous configuration makes it live again.
-            self._make_live_configured_model(model_template_id, name, reactivated_model_id)
-            self._make_live_template_version(template_name, model_template_id)
-            return reactivated_model_id
+            return self._reuse_configured_model(identical_configured_model, template_name)
 
         # create and add db entry
         configured_model = ConfiguredModelDB(
@@ -298,11 +285,42 @@ class SessionWrapper:
         # configured_model.validate_user_options(model_template)
         logger.info(f"Adding configured model: {configured_model}")
         self.session.add(configured_model)
-        self.session.commit()
+        try:
+            self.session.commit()
+        except sqlalchemy.exc.IntegrityError:
+            # A concurrent request can insert the same configuration between the existence
+            # check and this commit. Losing that race re-reads the winner's row.
+            self.session.rollback()
+            identical_configured_model = self._identical_configured_model(model_template_id, name, digest)
+            if identical_configured_model is None:
+                raise
+            return self._reuse_configured_model(identical_configured_model, template_name)
         configured_model_id = cast("int", configured_model.id)
 
         self._make_live_configured_model(model_template_id, name, configured_model_id)
         self._make_live_template_version(template_name, model_template_id)
+        return configured_model_id
+
+    def _identical_configured_model(self, model_template_id: int, name: str, digest: str) -> ConfiguredModelDB | None:
+        return self.session.exec(
+            select(ConfiguredModelDB).where(
+                ConfiguredModelDB.model_template_id == model_template_id,
+                ConfiguredModelDB.name == name,
+                ConfiguredModelDB.configuration_digest == digest,
+            )
+        ).first()
+
+    def _reuse_configured_model(self, configured_model: ConfiguredModelDB, template_name: str) -> int:
+        logger.info(
+            f"Configured model {configured_model.name} with an identical configuration already exists. "
+            "Returning existing id"
+        )
+        configured_model_id = cast("int", configured_model.id)
+        # Re-adding an archived configuration shows it again.
+        configured_model.archived = False
+        # Still flip is_live so that re-adding a previous configuration makes it live again.
+        self._make_live_configured_model(configured_model.model_template_id, configured_model.name, configured_model_id)
+        self._make_live_template_version(template_name, configured_model.model_template_id)
         return configured_model_id
 
     def _make_live_configured_model(self, model_template_id: int, name: str, configured_model_id: int) -> None:
@@ -616,6 +634,8 @@ class SessionWrapper:
         configured_model_id: int,
         metadata: dict | None = None,
         prediction_setup_id: int | None = None,
+        baseline_for_prediction_id: int | None = None,
+        alert_policy_id: int | None = None,
     ):
         if metadata is None:
             metadata = {}
@@ -638,10 +658,55 @@ class SessionWrapper:
             org_units=org_units,
             model_db_id=configured_model_id,
             prediction_setup_id=prediction_setup_id,
+            baseline_for_prediction_id=baseline_for_prediction_id,
+            alert_policy_id=alert_policy_id,
         )
         self.session.add(prediction)
         self.session.commit()
+        if prediction_setup_id is not None:
+            try:
+                self._upsert_prediction_setup_observations(prediction_setup_id, dataset_id)
+                self.session.commit()
+            except sqlalchemy.exc.IntegrityError:
+                # A concurrent run of the same setup inserted some of the rows first; they now exist, so retrying updates them.
+                self.session.rollback()
+                self._upsert_prediction_setup_observations(prediction_setup_id, dataset_id)
+                self.session.commit()
         return prediction.id
+
+    def _upsert_prediction_setup_observations(self, prediction_setup_id: int, dataset_id: int) -> None:
+        """Record the dataset's target values against the setup, overwriting values from earlier runs."""
+        target_column = self.session.exec(select(DataSet.target_column).where(DataSet.id == dataset_id)).one()
+        existing = {
+            (row.org_unit, row.period): row
+            for row in self.session.exec(
+                select(PredictionSetupObservation).where(
+                    PredictionSetupObservation.prediction_setup_id == prediction_setup_id
+                )
+            )
+        }
+        observations = self.session.exec(
+            select(Observation).where(
+                Observation.dataset_id == dataset_id,
+                Observation.feature_name == target_column,
+                col(Observation.value).is_not(None),
+            )
+        )
+        for obs in observations:
+            value = float(obs.value)  # type: ignore[arg-type]
+            if math.isnan(value):
+                continue
+            row = existing.get((obs.org_unit, obs.period))
+            if row is None:
+                row = PredictionSetupObservation(
+                    prediction_setup_id=prediction_setup_id,
+                    org_unit=obs.org_unit,
+                    period=obs.period,
+                    disease_cases=value,
+                )
+            else:
+                row.disease_cases = value
+            self.session.add(row)
 
 
 def _run_alembic_migrations(engine):

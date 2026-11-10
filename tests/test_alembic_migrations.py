@@ -48,17 +48,21 @@ _COLUMNS_ADDED_BY_MIGRATIONS = [
     ("configuredmodeldb", "configuration_digest"),
     ("configuredmodeldb", "is_live"),
     ("prediction", "prediction_setup_id"),
+    ("prediction", "baseline_for_prediction_id"),
+    ("prediction", "alert_policy_id"),
     ("backtest", "max_horizon_distance"),
     ("backtest", "specification_id"),
     ("backtest", "chap_version"),
     ("dataset", "created_manually"),
     ("alertpolicy", "no_alert_output_code"),
     ("dataset", "masked_ranges"),
+    ("dataset", "target_column"),
 ]
 
 # Tables added by alembic migrations (not in the baseline schema).
 # These are dropped after create_all so the migration can re-create them.
 _TABLES_ADDED_BY_MIGRATIONS = [
+    "predictionsetupobservation",
     "backendsettings",
     "predictionsetup",
     "specificationbaseline",
@@ -83,6 +87,15 @@ _COLUMNS_MADE_NOT_NULL_BY_MIGRATIONS = [
 _COLUMNS_RENAMED_BY_MIGRATIONS = [
     ("modeltemplatedb", "min_prediction_length", "min_prediction_periods"),
     ("modeltemplatedb", "max_prediction_length", "max_prediction_periods"),
+]
+
+
+# Indexes added by migrations, as (table, name). create_all makes them from the model
+# declarations, so the baseline drops them for the migration to create them again.
+_INDEXES_ADDED_BY_MIGRATIONS = [
+    ("observation", "ix_observation_dataset_feature_org_unit"),
+    ("backtestforecast", "ix_backtestforecast_backtest_org_unit"),
+    ("predictionsamplesentry", "ix_predictionsamplesentry_prediction"),
 ]
 
 
@@ -155,6 +168,8 @@ def _create_baseline_schema(engine):
             conn.execute(sa.text(f"ALTER TABLE {table} ALTER COLUMN {column} DROP NOT NULL"))
         for table, baseline_name, current_name in _COLUMNS_RENAMED_BY_MIGRATIONS:
             conn.execute(sa.text(f"ALTER TABLE {table} RENAME COLUMN {current_name} TO {baseline_name}"))
+        for _, name in _INDEXES_ADDED_BY_MIGRATIONS:
+            conn.execute(sa.text(f"DROP INDEX IF EXISTS {name}"))
         conn.commit()
 
 
@@ -255,11 +270,15 @@ class TestAlembicMigrations:
         assert not columns & {"n_periods", "n_splits", "stride", "n_retrain", "future_weather_provider"}
         assert "chap_version" in columns
 
+        inspector = sa.inspect(engine)
+        for table, name in _INDEXES_ADDED_BY_MIGRATIONS:
+            assert name in {index["name"] for index in inspector.get_indexes(table)}, f"{name} missing on {table}"
+
         from sqlmodel import Session
         from chap_core.database.settings import SettingsManager
 
         with Session(engine) as session:
-            assert SettingsManager(session).get().default_baseline_model == "persistence"
+            assert SettingsManager(session).get().default_baseline_model == "seasonal_shift_persistence"
 
     def test_downgrade_to_base_and_upgrade_again(self, engine):
         """
@@ -633,19 +652,27 @@ def test_target_column_migration_preserves_and_separates_specifications(engine):
     command.stamp(cfg, "head")
     command.downgrade(cfg, "d6e7f8a3b4c5")
     with engine.begin() as conn:
-        conn.execute(sa.text("INSERT INTO dataset (id, name) VALUES (1, 'targets')"))
+        conn.execute(sa.text("INSERT INTO dataset (id, name) VALUES (1, 'targets'), (2, 'custom')"))
         conn.execute(
             sa.text(
                 "INSERT INTO backtestspecification "
                 "(id, dataset_id, n_periods, n_splits, stride, n_retrain, future_weather_provider, org_units) "
-                "VALUES (1, 1, 3, 7, 1, 1, 'climatology', '[\"A\"]')"
+                "VALUES (1, 1, 3, 7, 1, 1, 'climatology', '[\"A\"]'), (2, 2, 3, 7, 1, 1, 'climatology', '[\"A\"]')"
             )
         )
-        conn.execute(sa.text("SELECT setval(pg_get_serial_sequence('backtestspecification', 'id'), 1)"))
+        conn.execute(sa.text("SELECT setval(pg_get_serial_sequence('backtestspecification', 'id'), 2)"))
         # Startup's generic migration adds the column as an empty string before Alembic runs.
         conn.execute(sa.text("ALTER TABLE backtestspecification ADD COLUMN target_column VARCHAR"))
         conn.execute(sa.text("UPDATE backtestspecification SET target_column = ''"))
+        # Dataset 2 was only ever backtested on a custom target, which it keeps.
+        conn.execute(sa.text("UPDATE backtestspecification SET target_column = 'cases' WHERE id = 2"))
+        # Startup's generic migration fills a new column with the model default before Alembic runs.
+        conn.execute(sa.text("ALTER TABLE dataset ADD COLUMN target_column VARCHAR"))
+        conn.execute(sa.text("UPDATE dataset SET target_column = 'disease_cases'"))
     command.upgrade(cfg, "head")
+    with engine.connect() as conn:
+        targets = conn.execute(sa.text("SELECT target_column FROM dataset ORDER BY id")).scalars().all()
+    assert targets == ["disease_cases", "cases"]
     with Session(engine) as session:
         wrapper = SessionWrapper(session=session)
         default = wrapper.get_or_create_backtest_specification(1, BacktestParams(), ["A"])
@@ -661,9 +688,39 @@ def test_target_column_migration_preserves_and_separates_specifications(engine):
         session.commit()
     command.downgrade(cfg, "d6e7f8a3b4c5")
     with engine.connect() as conn:
-        assert conn.execute(sa.text("SELECT id FROM backtestspecification")).scalars().all() == [1]
+        assert conn.execute(sa.text("SELECT id FROM backtestspecification ORDER BY id")).scalars().all() == [1, 2]
         assert conn.execute(sa.text("SELECT specification_id FROM backtest")).scalar_one() == 1
     command.upgrade(cfg, "head")
+
+
+@pytest.mark.slow
+def test_prediction_alert_policy_migration_clears_startup_placeholders(engine, alert_prediction):
+    from alembic import command
+
+    source, _ = alert_prediction
+    with engine.begin() as conn:
+        conn.execute(sa.text("DROP SCHEMA public CASCADE"))
+        conn.execute(sa.text("CREATE SCHEMA public"))
+    SQLModel.metadata.create_all(engine)
+    with engine.begin() as conn:
+        for table in SQLModel.metadata.sorted_tables:
+            rows = source.execute(sa.select(table)).mappings().all()
+            if rows:
+                conn.execute(table.insert(), [dict(row) for row in rows])
+
+    cfg = _make_alembic_cfg(engine)
+    command.stamp(cfg, "head")
+    command.downgrade(cfg, "e6f7a8b9c0d1")
+    with engine.begin() as conn:
+        # What the generic startup migration does before Alembic runs.
+        conn.execute(sa.text("ALTER TABLE prediction ADD COLUMN alert_policy_id INTEGER"))
+        conn.execute(sa.text("UPDATE prediction SET alert_policy_id = 0"))
+
+    command.upgrade(cfg, "head")
+    with engine.begin() as conn:
+        assert conn.execute(sa.text("SELECT alert_policy_id FROM prediction")).scalar_one() is None
+    foreign_keys = sa.inspect(engine).get_foreign_keys("prediction")
+    assert any(fk["referred_table"] == "alertpolicy" for fk in foreign_keys)
 
 
 @pytest.mark.slow

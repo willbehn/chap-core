@@ -217,6 +217,12 @@ def health_population_data(data_path):
 
 
 @pytest.fixture
+def laos_csv(data_path):
+    """Monthly data for three provinces, 2010-01 to 2012-12, with a sibling .geojson."""
+    return data_path / "laos_subset.csv"
+
+
+@pytest.fixture
 def nicaragua_path(data_path):
     return (data_path / "nicaragua_weekly_data").with_suffix(".csv")
 
@@ -397,6 +403,14 @@ def engine():
 
 
 @pytest.fixture
+def file_engine(tmp_path):
+    """A file-backed SQLite engine, so separate sessions get separate connections (e.g. to simulate concurrent runs)."""
+    eng = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    SQLModel.metadata.create_all(eng)
+    return eng
+
+
+@pytest.fixture
 def test_config():
     return WorkerConfig(is_test=True)
 
@@ -445,6 +459,8 @@ def alert_prediction():
 
     from chap_core.assessment.thresholds.params import PercentileParams
     from chap_core.database.alert_tables import AlertLevel, AlertPolicy
+    from chap_core.database.database import SessionWrapper
+    from chap_core.database.model_template_seed import seed_builtin_models
     from chap_core.database.dataset_tables import DataSet, Observation
     from chap_core.database.model_templates_and_config_tables import ConfiguredModelDB, ModelTemplateDB
     from chap_core.database.tables import (
@@ -512,6 +528,7 @@ def alert_prediction():
             model_id=model.name,
             model_db_id=model.id,
             prediction_setup=setup,
+            alert_policy_id=policy.id,
             n_periods=2,
             name="alert-prediction",
             created=datetime.datetime.now(),
@@ -523,5 +540,7 @@ def alert_prediction():
         )
         session.add(prediction)
         session.commit()
+        # Setup runs also forecast with the default baseline model.
+        seed_builtin_models(SessionWrapper(session=session))
         yield session, prediction
     engine.dispose()

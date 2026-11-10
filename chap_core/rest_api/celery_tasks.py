@@ -6,9 +6,11 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, TypeVar, cast
+from urllib.parse import urlsplit
 
 import celery
-from celery import Celery, Task, shared_task
+from celery import Celery, Task, shared_task, signals
+from celery.exceptions import WorkerLostError
 from celery.result import AsyncResult
 from celery.utils.log import get_task_logger
 from dotenv import find_dotenv, load_dotenv
@@ -87,9 +89,20 @@ def read_environment_variables():
     return host
 
 
+def broker_host(url: str) -> str:
+    """Return host:port of a broker URL, leaving out credentials so it is safe to log."""
+    parts = urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:
+        # Not a plain integer port, e.g. kombu's ";"-separated failover URLs. This runs at import, so never raise.
+        port = None
+    return f"{parts.hostname}:{port}" if port else str(parts.hostname)
+
+
 # Setup celery
 url = read_environment_variables()
-logger.info(f"Connecting to {url}")
+logger.info(f"Connecting to Celery broker at {broker_host(url)}")
 app = Celery("worker", broker=url, backend=url)
 app.conf.update(
     # JSON only: a pickled message would let anyone who can write to the broker run code on the worker.
@@ -103,6 +116,9 @@ app.conf.update(
     task_track_started=True,
     task_send_sent_event=True,
     worker_send_task_events=True,
+    # A prefork child keeps the memory its first job allocated (about 240 MiB) for as long as it lives,
+    # so replace it after every job. Jobs run for minutes, so the fork is cheap by comparison.
+    worker_max_tasks_per_child=1,
 )
 
 
@@ -264,6 +280,35 @@ class TrackedTask(Task):
         )
 
 
+@signals.task_failure.connect
+def record_lost_worker(sender=None, task_id=None, exception=None, **_kwargs):
+    """Mark a job as failed when the worker process running it dies.
+
+    `TrackedTask.on_failure` runs inside the worker process, so it never runs when that process is
+    killed (out of memory, a signal). Celery's main worker process then reports `WorkerLostError`
+    through this signal. Without this the job stays STARTED forever.
+    """
+    if not isinstance(exception, WorkerLostError):
+        return
+    key = f"job_meta:{task_id}"
+    # Only a job chap tracks, and only one that has not already finished.
+    if r.hget(key, "status") not in ("PENDING", "STARTED"):
+        return
+    r.hset(
+        key,
+        mapping={
+            "status": "FAILURE",
+            "error": (
+                f"The worker process running this job was killed ({exception}). It may have run out of "
+                "memory: try with less data, or ask an administrator to check the worker's memory limit."
+            )[:JOB_ERROR_MAX_CHARS],
+            # The job's log ends where the process died; the logs endpoint appends this to say why.
+            "traceback": f"{type(exception).__name__}: {exception}",
+            "end_time": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
 @shared_task(name="celery.ping")
 def ping():
     return "pong"
@@ -314,8 +359,8 @@ def worker_database_url() -> str:
 
 @app.task(base=TrackedTask)
 def celery_run_with_session(func_name: str, *args, **kwargs):
-    # A database URL in the message is ignored: anyone who can write to the broker could
-    # otherwise point the worker at a database holding a model that runs their code.
+    # Older versions put a database URL in the message. It stays ignored: anyone who can write to the
+    # broker could otherwise point the worker at a database holding a model that runs their code.
     kwargs.pop("database_url", None)
     database_url = worker_database_url()
     if database_url not in ENGINES_CACHE:
