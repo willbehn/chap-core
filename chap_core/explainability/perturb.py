@@ -323,24 +323,39 @@ class FourierReplacement:
         return segment.tolist()
 
 class ClimatologyMonthly:
-    """TODO not done
-    First iteration of a sampler that uses climatology as background.
-    Not very robust, need to fix
-    Also needs to decide on what should be the minimum number of samples for one month 
-    in the warn_if_few_samples
     """
+    Baseline where each value is replaced by its climatology, which is the mean for the same location and
+    calendar month, computed from the periods before the explained window.
+
+    The baseline is "normal for this location and time of year", so the explanation shows how the
+    prediction differs from a seasonal normal one. 
+
+    Requires ``last_n`` and at least 12 months of history before the explained window. Months with no
+    samples for a feature are filled from neighbouring months.
+
+    TODO:
+        What should the minimum number of samples per month be?
+    """
+
 
     min_baseline_samples = 3
 
     def __init__(self, dataset: pd.DataFrame, last_n: int | None):
+        self.warned: set[tuple[str, int, str]] = set()
+
         if last_n is None:
             raise ValueError("ClimatologyMonthly must be used with last_n set")
 
-        # TODO mby remove, not sure if I am going to exclude the explained window or not yet
         periods = sorted(dataset["time_period"].unique())
-        if last_n >= len(periods):
-            raise ValueError(f"last_n={last_n} covers the whole dataset, so no data for the climatology baseline")
-        
+
+        if len(periods) - last_n < 12:
+            raise ValueError(
+                f"ClimatologyMonthly needs at least 12 months of history before the explained window "
+                f"(last_n={last_n}, dataset has {len(periods)} periods)"
+            )
+
+        # TODO check per location that atleast 12 months are covered
+
         df = dataset[dataset["time_period"] < periods[-last_n]].copy()
 
         df["month"] = [p.month for p in df["time_period"]]
@@ -348,8 +363,14 @@ class ClimatologyMonthly:
         self.table = grouped.mean(numeric_only=True)
         self.counts = grouped.count()
 
-        #TODO might not need if not part of report
-        self.warned: set[tuple[str, int, str]] = set()
+        # If a month for a feature has no samples it is filled with the mean of the previous and next months.
+        # If both neighbours are missing as well the locations mean over all months is used.
+        # TODO do more testing on what is the right approach here
+        location_means = df.groupby("location").mean(numeric_only=True)
+        fallback = location_means.reindex(self.table.index, level="location")
+
+        self.table = self._neighbour_mean(self.table).fillna(fallback)
+
 
     def sample(self, hist_df: pd.DataFrame, indices: tuple[int, int], feature_name: str, length: int):
         start, end = indices
@@ -364,10 +385,37 @@ class ClimatologyMonthly:
     def sample_future(self, hist_df: pd.DataFrame, fut_df: pd.DataFrame, feature_name: str, step: int) -> float:
         location = hist_df["location"].iloc[0]
         month = fut_df["time_period"].iloc[step].month
-        
+
         self._warn_if_few_samples(location, month, feature_name)
 
         return float(self.table.loc[(location, month), feature_name])
+
+
+    @staticmethod
+    def _neighbour_mean(table: pd.DataFrame) -> pd.DataFrame:
+        """
+        Fills empty months with the mean of the same locations previous and next month.
+
+        TODO can probably make it shorter
+        """
+        filled = table.copy()
+
+        for location, month in table.index:
+            prev_month = (month - 2) % 12 + 1
+            next_month = month % 12 + 1
+
+            for feature in table.columns:
+                if pd.isna(table.loc[(location, month), feature]):
+                    neighbours = pd.Series(
+                        [
+                            table.loc[(location, prev_month), feature],
+                            table.loc[(location, next_month), feature],
+                        ]
+                    )
+                    filled.loc[(location, month), feature] = neighbours.mean()
+
+        return filled
+
 
     def _warn_if_few_samples(self, location: str, month: int, feature_name: str):
         n = int(self.counts.loc[(location, month), feature_name])
@@ -380,4 +428,5 @@ class ClimatologyMonthly:
             logger.warning(
                 f"Less than {self.min_baseline_samples} samples was used for the baseline "
                 f"({feature_name}, location {location}, month {month}: {n} sample(s))"
+                + (", using the mean of the neighbouring months instead" if n == 0 else "")
             )
