@@ -1,4 +1,5 @@
 import logging
+import math
 from pathlib import Path
 
 import matplotlib.cm as cm
@@ -7,6 +8,7 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Rectangle
 
 from chap_core.explainability.perturb import SampleModel
 from chap_core.explainability.plot import parse_coefficients
@@ -23,6 +25,14 @@ This is just for testing and is work in progress.
 Some parts of the code have been altered, by most of it is direclty used from LIME.
 """
 
+def make_explainability_run_dir(model_name: str | None, run_name: str) -> Path:
+    """Creates and return runs/explainability/<model_name>/<run_name>."""
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in (model_name or "unknown"))
+    run_dir = CHAP_RUNS_DIR / "explainability" / safe_name / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
 def save_shap_explanation(
     results: list[tuple[str, float]],
     model_name: str | None,
@@ -36,12 +46,9 @@ def save_shap_explanation(
     """
     Based on implementation from LIME pipeline currently
     """
-    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in (model_name or "unknown"))
-
     run_name = generate_run_name()
     timestamp = run_name.rsplit("_", 1)[0]
-    run_dir = CHAP_RUNS_DIR / "explainability" / safe_name / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = make_explainability_run_dir(model_name, run_name)
 
     lines = [
         "# SHAP Explanation",
@@ -106,6 +113,58 @@ def save_shap_explanation(
     return md_path
 
 
+def variable_totals(coefficients: list[tuple[str, float]]) -> dict[str, float]:
+    """Sum the SHAP values of all segments and future steps of each variable."""
+    temp_columns, static_columns = parse_coefficients(coefficients)
+    totals = {name: sum(lags.values()) for name, lags in temp_columns.items()}
+    totals.update(static_columns)
+    return totals
+
+
+def draw_waterfall(
+    ax,
+    totals: dict[str, float],
+    baseline_prediction: float,
+    prediction: float,
+    colors: dict[str, tuple],
+    fontsize: int = 9,
+):
+    """Baseline -> one step per variable (largest |SHAP| first) -> prediction, on a single axis."""
+    names = sorted(totals, key=lambda name: abs(totals[name]), reverse=True)
+    labels = ["Baseline", *names, "Prediction"]
+    width = 0.6
+
+    def label(x, top, text):
+        ax.annotate(
+            text, (x, top), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=fontsize
+        )
+
+    ax.bar(0, baseline_prediction, width, color="darkgray")
+    label(0, baseline_prediction, f"{baseline_prediction:.1f}")
+
+    level = baseline_prediction
+    for i, name in enumerate(names, start=1):
+        value = totals[name]
+        ax.plot([i - 1 + width / 2, i - width / 2], [level, level], color="gray", linewidth=0.8)
+        ax.bar(i, value, width, bottom=level, color=colors[name])
+        label(i, max(level, level + value), f"{value:+.1f}")
+        level += value
+
+    end = len(labels) - 1
+    ax.plot([end - 1 + width / 2, end - width / 2], [level, level], color="gray", linewidth=0.8)
+    ax.bar(end, prediction, width, color="black")
+    label(end, prediction, f"{prediction:.1f}")
+
+    # Headroom so the value labels don't run into the title
+    levels = baseline_prediction + np.cumsum([0.0] + [totals[name] for name in names])
+    low, high = min(0.0, *levels, prediction), max(0.0, *levels, prediction)
+    ax.set_ylim(low - 0.05 * (high - low), high + 0.15 * (high - low))
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=fontsize)
+    ax.spines[["top", "right"]].set_visible(False)
+
+
 def plot_shap_waterfall(
     coefficients: list[tuple[str, float]],
     baseline_prediction: float,
@@ -117,47 +176,67 @@ def plot_shap_waterfall(
 
     The SHAP values of all segments and future steps of a variable are summed.
     """
-    temp_columns, static_columns = parse_coefficients(coefficients)
-
-    totals = {name: sum(lags.values()) for name, lags in temp_columns.items()}
-    totals.update(static_columns)
+    totals = variable_totals(coefficients)
     names = sorted(totals, key=lambda name: abs(totals[name]), reverse=True)
 
-    labels = ["Baseline"] + names + ["Prediction"]
-    width = 0.6
-    fig, ax = plt.subplots(figsize=(1.4 * len(labels) + 1, 4.5))
-
-    def label(x, top, text):
-        ax.annotate(text, (x, top), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=9)
-
-    ax.bar(0, baseline_prediction, width, color="darkgray")
-    label(0, baseline_prediction, f"{baseline_prediction:.1f}")
-
     # One colour per variable group
-    colors = plt.get_cmap("tab10")
-    level = baseline_prediction
-    for i, name in enumerate(names, start=1):
-        value = totals[name]
-        ax.plot([i - 1 + width / 2, i - width / 2], [level, level], color="gray", linewidth=0.8)
-        ax.bar(i, value, width, bottom=level, color=colors((i - 1) % colors.N))
-        label(i, max(level, level + value), f"{value:+.1f}")
-        level += value
+    cmap = plt.get_cmap("tab10")
+    colors = {name: cmap(i % cmap.N) for i, name in enumerate(names)}
 
-    end = len(labels) - 1
-    ax.plot([end - 1 + width / 2, end - width / 2], [level, level], color="gray", linewidth=0.8)
-    ax.bar(end, prediction, width, color="black")
-    label(end, prediction, f"{prediction:.1f}")
-
-    ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, fontsize=9)
+    fig, ax = plt.subplots(figsize=(1.4 * (len(names) + 2) + 1, 4.5))
+    draw_waterfall(ax, totals, baseline_prediction, prediction, colors)
     ax.set_ylabel("Prediction (disease cases)")
-    ax.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
 
     if save_path is not None:
         fig.savefig(save_path, dpi=150)
         plt.close(fig)
         logger.info(f"Waterfall plot saved to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_shap_waterfall_grid(
+    explanations: dict[str, tuple[list[tuple[str, float]], float, float]],
+    save_path: Path | None = None,
+):
+    """
+    One waterfall per location in a grid, based on plot_all_locations.py.
+
+    ``explanations`` maps location -> (SHAP results, prediction, baseline prediction), as returned
+    by kernel_shap.explain. Each variable has the same colour in every panel. Y-axes are not shared.
+    """
+    totals = {loc: variable_totals(results) for loc, (results, _, _) in explanations.items()}
+
+    # Colours by mean |SHAP| over locations, panels by prediction (highest first)
+    variables = pd.DataFrame(totals).T.fillna(0.0).abs().mean().sort_values(ascending=False).index
+    cmap = plt.get_cmap("tab10")
+    colors = {var: cmap(i % cmap.N) for i, var in enumerate(variables)}
+    locations = sorted(explanations, key=lambda loc: explanations[loc][1], reverse=True)
+
+    n = len(locations)
+    ncols = min(4, n)
+    nrows = math.ceil(n / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 3.6 * nrows), squeeze=False)
+
+    for ax, loc in zip(axes.flat, locations, strict=False):
+        _, prediction, baseline_prediction = explanations[loc]
+        draw_waterfall(ax, totals[loc], baseline_prediction, prediction, colors, fontsize=8)
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+        ax.set_title(loc, fontsize=11, loc="left")
+    for ax in axes.flat[n:]:
+        ax.set_visible(False)
+
+    handles = [Rectangle((0, 0), 1, 1, color=color, label=var) for var, color in colors.items()]
+    fig.legend(handles=handles, loc="upper right", ncols=len(handles), frameon=False, fontsize=9)
+    fig.suptitle("SHAP explanation per location. Y-axes are not shared.", x=0.01, ha="left", fontsize=12)
+    fig.supylabel("Prediction (disease cases)")
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+        logger.info(f"Waterfall grid saved to {save_path}")
     else:
         plt.show()
 

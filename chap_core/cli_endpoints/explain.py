@@ -191,8 +191,7 @@ def explain(
     """
     Explain a model's prediction with SHAP (temporary docs).
 
-    Note: under development. Debug comments are still in place and tests
-    are not done yet.
+    Note: under development. Debug comments are still in place and tests are not done yet.
 
     Requirements:
         Reuses the model's working directory from an earlier run, so
@@ -211,8 +210,13 @@ def explain(
     """
 
     from chap_core.explainability.kernel_shap import explain as explain_shap
+    from chap_core.explainability.temp_save_and_plotting import (
+        make_explainability_run_dir,
+        plot_shap_waterfall_grid,
+    )
     from chap_core.log_config import initialize_logging
     from chap_core.models.model_template import ModelTemplate
+    from chap_core.util import generate_run_name
 
     logger.info(f"Explaining model {model_name} using SHAP with background {baseline}")
 
@@ -223,7 +227,6 @@ def explain(
     dataset = load_dataset_from_csv(csv_path, geojson_path)
 
     locations = _resolve_locations(location, all_locations, list(dataset.locations()))
-
 
     template = ModelTemplate.from_directory_or_github_url(
         model_name,
@@ -236,16 +239,17 @@ def explain(
     with template:
         estimator = template.get_model()()
 
+        explanations = {}
         for loc in locations:
             logger.info(f"Generating SHAP explanation for {loc}, {horizon} time steps into the future")
 
-            results = explain_shap(
+            results, prediction, baseline_prediction = explain_shap(
                 model=estimator,
                 dataset=dataset,
                 location=loc,
                 horizon=horizon,
                 num_perturbations=num_perturbations,
-                sampler_name = baseline,
+                sampler_name=baseline,
                 seed=seed,
                 last_n=last_n,
                 granularity=granularity,
@@ -256,6 +260,12 @@ def explain(
 
             for name, value in results:
                 logger.info(f"  {name:>15} = {value:+.4f}")
+
+            explanations[loc] = (results, prediction, baseline_prediction)
+
+        if all_locations:
+            grid_dir = make_explainability_run_dir(estimator.name, f"all_locations_{generate_run_name()}")
+            plot_shap_waterfall_grid(explanations, save_path=grid_dir / "shap_grid.png")
 
 
 def register_commands(app):

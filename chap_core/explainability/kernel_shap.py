@@ -143,12 +143,12 @@ def explain(
     save: bool = False,
     plot: bool = False,
     fast: bool = False,
-) -> list[tuple[str, float]]:
+) -> tuple[list[tuple[str, float]], float, float]:
     """
     Explain one location's forecast with Kernel SHAP.
 
-    Returns a list of (feature name, SHAP value) pairs. The values sum to
-    prediction - baseline prediction.
+    Returns (results, prediction, baseline prediction), where results is a list of
+    (feature name, SHAP value) pairs.
 
     Notes:
         ``sampler_name`` is the baseline: ``global_mean`` or ``climatology_monthly``.
@@ -157,6 +157,7 @@ def explain(
         (``2**num_inputs`` coalitions), ignoring ``num_perturbations``.
         ``scope_explanation`` and ``prune_threshold`` are disabled for now (WIP).
     """
+    
     start = time.perf_counter()
     if timed:
         logger.info("Started SHAP pipeline")
@@ -264,7 +265,7 @@ def explain(
         waterfall_plot_path = saved_dir / "waterfall_plot.png" if saved_dir is not None else None
         plot_shap_waterfall(result, baseline_prediction, prediction, save_path=waterfall_plot_path)
 
-    return result
+    return result, prediction, baseline_prediction
 
 
 # Helper function that removes static features from feature_map. This will result in the static features allways have
